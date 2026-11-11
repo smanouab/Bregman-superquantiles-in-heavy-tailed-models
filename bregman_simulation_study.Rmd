@@ -1,0 +1,1450 @@
+---
+title: "Bregman superquantiles: Monte Carlo study and comparison with the asymptotic theory"
+subtitle: "Empirical, kernel and recursive (Newton gains, Polyak-Ruppert averaging) estimators; bandwidth sweep $h_n=n^{-a}$"
+author: "Solym Manou-Abi, Yousri Slaoui"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+params:
+  quick: false          # TRUE: reduced sizes (checks the notebook in a few minutes)
+  cores: 1              # cores for parallel::mclapply (Linux/macOS; forced to 1 on Windows)
+  n: 20000              # final sample size of the main experiment
+  M: 5000               # Monte Carlo replications of the main experiment
+  block: 250            # replications processed together (vectorisation + checkpoint)
+  p_levels: "0.25,0.5,0.75,0.95"
+  a_rec: "0.1,0.2,0.25,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95"   # h_n = n^(-a) of the recursive kernel estimator
+  a_default: 0.3        # bandwidth exponent of the reference kernel estimators (undersmoothing: a > 1/4)
+  rho_pr: 0.8           # step exponent of the Polyak-Ruppert recursion (steps n^-rho; 0.8 = best choice, Table rho)
+  a_rec_ref: 0.4        # second reference bandwidth h_n = n^(-0.4) for the recursive estimators (stronger undersmoothing)
+  h_scale: "none"       # "none": h_n = n^(-a); "robust": h_n = (IQR/1.349) n^(-a)
+  n_ks: "250,1000,5000,20000,50000,100000"   # sample sizes of the Kolmogorov-distance experiment
+  M_ks: 1000
+  M_bw: 1000            # replications of the bandwidth-regime experiment (batch kernel)
+  M_param: 1000         # replications of the GPD parameter experiment
+  n_param: 5000
+  M_stable: 200         # replications of the stable parameter experiment
+  n_stable: 5000
+  stable_alpha: "1.5"
+  stable_beta: "0,0.5"
+  out: "sim_out"
+  run_main: true
+  run_ks: true
+  run_bw: true
+  run_traj: true
+  run_stream: true
+  run_gpd: true
+  run_stable: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 14, fig.height = 8, dpi = 100)
+for (pk in c("stabledist", "ggplot2", "dplyr", "tidyr", "knitr"))
+  if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk)
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(tidyr); library(knitr)
+})
+RNGkind("L'Ecuyer-CMRG")
+## When chunks are run interactively (RStudio "Run chunk"), `params` does not exist:
+## the YAML defaults are recreated here so that every chunk and every chunk option works.
+if (!exists("params")) {
+  params <- list(quick = FALSE, cores = 1, n = 20000, M = 5000, block = 250,
+                 p_levels = "0.25,0.5,0.75,0.95", a_rec = "0.1,0.2,0.25,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95",
+                 a_default = 0.3, a_rec_ref = 0.4, rho_pr = 0.8, h_scale = "none", n_ks = "250,1000,5000,20000,50000,100000", M_ks = 1000,
+                 M_bw = 1000, M_param = 1000, n_param = 5000, M_stable = 200, n_stable = 5000,
+                 stable_alpha = "1.5", stable_beta = "0,0.5", out = "sim_out",
+                 run_main = TRUE, run_ks = TRUE, run_bw = TRUE, run_traj = TRUE, run_stream = TRUE,
+                 run_gpd = TRUE, run_stable = TRUE)
+}
+```
+
+# Aims of the study
+
+The Monte Carlo experiments assess the finite-sample performance of the empirical, kernel-based and recursive
+kernel-based estimators of the Bregman superquantile
+$$SQ_p^\gamma(X)=(\gamma')^{-1}\!\Big(\tfrac{1}{1-p}\,\mathbb E\big[\gamma'(X)\mathbf 1_{\{X\ge Q_p\}}\big]\Big),\qquad Q_p=F^{-1}(p),$$
+and confront them with the asymptotic theory of the revised article. The objectives are fourfold:
+
+1. to assess the **finite-sample accuracy** of the empirical, kernel and recursive estimators;
+2. to provide an **empirical validation of the asymptotic theory**: consistency, asymptotic normality
+   (Kolmogorov distance to the Gaussian limit), asymptotic variances, bias expansions and bandwidth regimes,
+   including the influence of the bandwidth and of the tail heaviness;
+3. to illustrate the advantages of **recursive estimation** for large-scale and streaming data;
+4. to evaluate Bregman superquantiles as **building blocks for robust parameter estimation** in heavy-tailed models
+   (generalized Pareto and stable distributions).
+
+**Estimators.**
+
+| Code | Estimator | Remark |
+|---|---|---|
+| `emp` | empirical (Definition 2.1) | |
+| `ker` | Gaussian-kernel estimator (Definition 2.2), $h_n=n^{-a}$, $a=$ `a_default` | bias $B'h_n^2$ |
+| `rec_ind` | Robbins–Monro with **indicator** $W_{n+1}=\mathbf 1_{\{X_{n+1}\le Q_n\}}$, step $1/n$, Newton gains $\Lambda=\hat A^{-1}$ | reference of the bandwidth sweep |
+| `rec_ker` | recursive **kernel** estimator, $W_{n+1}=H((Q_n-X_{n+1})/h_n)$, step $1/n$, Newton gains $\Lambda=\hat A^{-1}$ (Corollary 3.4) | sweep $a\in$ `a_rec`; variance $\sigma^2$ |
+| `rec_pr` | recursive kernel estimator, step $n^{-\rho}$ (`rho_pr`, default 0.8) and **Polyak–Ruppert averaging** of the iterates | variance $\sigma^2$; no estimate of $A$ needed |
+| `rec_ker04`, `rec_pr04` | the two recursive kernel estimators above with $h_n=n^{-0.4}$ (`a_rec_ref`) | stronger undersmoothing: smaller recursive bias |
+
+Newton gains (or averaging) are needed to reach the batch variance $\sigma^2$ (Corollary 3.4); all recursive
+estimators of this notebook therefore use one of these two devices.
+
+**Design.** $\mathcal N(0,1)$, GPD$(0.3,1)$, GPD$(0.8,1)$ and $S_0(1.5,0,1,0)$; generators `quad`
+($\gamma'(x)=x$, CVaR) and `asinh` ($\gamma'(x)=\operatorname{asinh}x$); $p\in\{0.25,0.50,0.75,0.95\}$;
+$n=20\,000$ and $M=5\,000$ replications. All estimators of a replication use **the same sample** (common random numbers)
+and all recursive estimators share **the same warm start**.
+
+**Regimes.** *Regular* when $\mathrm{Var}(\gamma'(X))<\infty$ (the CLT applies: all distributions with `asinh`,
+$\mathcal N(0,1)$ and GPD$(0.3)$ with `quad`); *non-regular* otherwise (GPD$(0.8)$ and the stable law with `quad`:
+finite mean, infinite variance). Non-regular results are robustness checks, not validations of the CLT.
+
+**Corrections with respect to earlier versions of the code.**
+(i) $\sigma^2=\mathrm{Var}\big((\gamma'(X)-\gamma'(q_p))_+\big)/\{(1-p)^2\gamma''(SQ)^2\}$
+(the former `sig2_hat`/`truth` used $\gamma'(X)\mathbf 1_{\{X\ge q\}}-\gamma'(q)\mathbf 1_{\{X\le q\}}$, wrong sign);
+(ii) $B'=\mu_2\{\gamma''(q)f(q)+\int_q^\infty\gamma'''f\}/\{2(1-p)\gamma''(SQ)\}$, without the spurious term $-2\gamma'(q)f'(q)$;
+(iii) $\Gamma_{12}=+p\,\theta_p$ in the Lyapunov equation (the former sign produced impossible efficiencies $>1$);
+(iv) `params` is never modified (it is read-only in `rmarkdown`) and is recreated for interactive use;
+(v) tail integrals never evaluate $Q(1)=\infty$ and fall back to looser tolerances instead of returning silent `NA`s
+(the cause of the error `Faceting variables must have at least one value`); figures with no data are skipped with a message;
+(vi) the bandwidth $h=\hat s\,n^{-1/5}$ ($a<1/4$) oversmooths; the reference kernel estimators use $a=0.3$.
+
+# Configuration
+
+```{r config}
+#' Builds the configuration from the YAML parameters (params is never modified).
+make_cfg <- function(pr) {
+  num <- function(s) as.numeric(strsplit(as.character(s), ",")[[1]])
+  cfg <- list(quick = isTRUE(pr$quick), cores = max(1L, as.integer(pr$cores)),
+              n = as.integer(pr$n), M = as.integer(pr$M), block = as.integer(pr$block),
+              p_levels = num(pr$p_levels), a_rec = sort(unique(num(pr$a_rec))),
+              a_default = as.numeric(pr$a_default),
+              a_rec_ref = if (is.null(pr$a_rec_ref)) 0.4 else as.numeric(pr$a_rec_ref),
+              rho_pr = if (is.null(pr$rho_pr)) 0.8 else as.numeric(pr$rho_pr), h_scale = as.character(pr$h_scale),
+              n_ks = sort(as.integer(num(pr$n_ks))), M_ks = as.integer(pr$M_ks),
+              M_bw = as.integer(pr$M_bw), M_param = as.integer(pr$M_param), n_param = as.integer(pr$n_param),
+              M_stable = as.integer(pr$M_stable), n_stable = as.integer(pr$n_stable),
+              stable_alpha = num(pr$stable_alpha), stable_beta = num(pr$stable_beta),
+              out = as.character(pr$out), seed = 20261109L)
+  if (cfg$quick)
+    cfg <- modifyList(cfg, list(n = 5000L, M = 200L, block = 100L, n_ks = c(250L, 1000L, 5000L), M_ks = 100L,
+                                M_bw = 200L, M_param = 100L, n_param = 2000L, M_stable = 10L, n_stable = 2000L))
+  if (.Platform$OS.type == "windows") cfg$cores <- 1L
+  if (!cfg$h_scale %in% c("none", "robust")) stop("h_scale must be 'none' or 'robust'.")
+  cfg$a_rec <- sort(unique(c(cfg$a_rec, cfg$a_default, cfg$a_rec_ref)))
+  cfg$a_pr <- unique(c(cfg$a_default, cfg$a_rec_ref))
+  cfg$block <- min(cfg$block, cfg$M)
+  cfg$M <- cfg$block * ceiling(cfg$M / cfg$block)
+  n0_max <- n0_rule(max(cfg$p_levels))
+  g <- unique(as.integer(round(cfg$n / c(16, 8, 4, 2, 1))))
+  cfg$n_grid <- g[g >= 2 * n0_max]
+  for (d in c("", "figures", "tables")) dir.create(file.path(cfg$out, d), showWarnings = FALSE, recursive = TRUE)
+  cfg
+}
+
+#' Warm-start size: at least 20 expected observations beyond Q_p.
+n0_rule <- function(p) as.integer(max(200, ceiling(20 / (1 - p))))
+
+cfg <- make_cfg(params)
+str(cfg[c("n", "M", "block", "n_grid", "p_levels", "a_rec", "a_default", "a_rec_ref", "h_scale", "n_ks", "M_ks", "cores")])
+```
+
+# Function library
+
+## Bregman generators
+
+`g1` $=\gamma'$, `g2` $=\gamma''$, `g3` $=\gamma'''$, `ginv` $=(\gamma')^{-1}$. The `asinh` generator has logarithmic
+growth: $\gamma'(X)$ has moments of all orders, which restores the CLT regime for infinite-variance distributions.
+
+```{r generators}
+make_generator <- function(name, s = 1, a = 0.5) {
+  switch(name,
+    quad = list(name = "quad", label = "Quadratic (CVaR)", growth = "linear",
+                g1 = function(x) x, g2 = function(x) rep(1, length(x)),
+                g3 = function(x) rep(0, length(x)), ginv = function(y) y),
+    asinh = list(name = "asinh", label = "asinh (Bregman)", growth = "log", s = s,
+                 g1 = function(x) asinh(x / s),
+                 g2 = function(x) 1 / (s * sqrt(1 + (x / s)^2)),
+                 g3 = function(x) -(x / s) / (s^2 * (1 + (x / s)^2)^1.5),
+                 ginv = function(y) s * sinh(y)),
+    sin = list(name = "sin", label = "x + a cos x", growth = "linear", a = a,
+               g1 = function(x) x + a * cos(x), g2 = function(x) 1 - a * sin(x),
+               g3 = function(x) -a * cos(x),
+               ginv = function(y) { x <- y; for (k in 1:60) x <- x - (x + a * cos(x) - y) / (1 - a * sin(x)); x }),
+    stop("Unknown generator: ", name))
+}
+gens <- list(quad = make_generator("quad"), asinh = make_generator("asinh"))
+gen_lab <- vapply(gens, `[[`, "", "label")
+```
+
+## Distributions and tail integrals
+
+Each distribution provides `tail_int(fun, q)` $=\int_q^\infty \mathrm{fun}(x)f(x)\,dx$, computed without evaluating
+$Q(1)=\infty$: exact change of variables for the GPD, density integration for the Gaussian law and, for the stable law,
+integration of `dstable` on $[q,q+200\gamma]$ completed by the Pareto tail
+$f(x)\sim\alpha\,C_\alpha(1+\beta)\gamma^\alpha x^{-\alpha-1}$, $C_\alpha=\Gamma(\alpha)\sin(\pi\alpha/2)/\pi$.
+`excess(q)` $=\mathbb E[(X-q)^+]$ is exact (stable law: relation $H$ of Theorem 6.1).
+
+```{r distributions}
+gauss_legendre <- function(m) {
+  i <- seq_len(m - 1); b <- i / sqrt(4 * i^2 - 1)
+  J <- matrix(0, m, m); J[cbind(i, i + 1)] <- b; J[cbind(i + 1, i)] <- b
+  e <- eigen(J, symmetric = TRUE); o <- order(e$values)
+  list(x = e$values[o], w = 2 * e$vectors[1, o]^2)
+}
+gauss_laguerre <- function(m) {          # int_0^inf g(t) exp(-t) dt ~ sum w_j g(t_j)
+  i <- seq_len(m); J <- diag(2 * i - 1); k <- seq_len(m - 1)
+  J[cbind(k, k + 1)] <- k; J[cbind(k + 1, k)] <- k
+  e <- eigen(J, symmetric = TRUE); o <- order(e$values)
+  list(x = e$values[o], w = e$vectors[1, o]^2)
+}
+.GL20 <- gauss_legendre(20); .GL40 <- gauss_legendre(40); .GLag <- gauss_laguerre(64)
+
+#' Nolan's integral g_{-1}(x | alpha, beta) = int_0^inf [cos(x r - beta tan(pi alpha/2) r^alpha) - 1] r^-2 exp(-r^alpha) dr
+g_m1 <- function(x, alpha, beta) {
+  tn <- tan(pi * alpha / 2); R <- 34^(1 / alpha)
+  phase <- max(abs(x)) * R + abs(beta * tn) * R^alpha
+  npan <- min(400, max(8, ceiling(phase / 12)))
+  edges <- seq(0, R, length.out = npan + 1); a <- edges[-length(edges)]; b <- edges[-1]
+  half <- (b - a) / 2; mid <- (a + b) / 2
+  r <- as.vector(outer(.GL20$x, half) + matrix(mid, 20, npan, byrow = TRUE))
+  w <- as.vector(outer(.GL20$w, half)); er <- exp(-r^alpha) / r^2; rA <- r^alpha
+  vapply(x, function(xi) sum(w * (-2 * sin((xi * r - beta * tn * rA) / 2)^2) * er), numeric(1))
+}
+
+#' Theorem 6.1: E[(X - Q)^+] for X ~ S0(alpha, beta, gam, zeta), alpha > 1 (vectorised in Q).
+H_stable <- function(Q, alpha, beta, gam = 1, zeta = 0) {
+  tn <- tan(pi * alpha / 2); z <- (Q - zeta + beta * gam * tn) / gam
+  0.5 * (zeta - beta * gam * tn - Q) + (gam / pi) * (base::gamma(1 - 1 / alpha) - g_m1(z, alpha, beta))
+}
+
+memo <- function(f) {
+  cache <- new.env(hash = TRUE)
+  function(u) vapply(u, function(v) {
+    k <- sprintf("%.15g", v)
+    if (!exists(k, envir = cache, inherits = FALSE)) assign(k, f(v), envir = cache)
+    get(k, envir = cache)
+  }, numeric(1))
+}
+
+#' Robust numerical integration: non-finite integrand values are set to 0 (they only occur at the
+#' boundary point Q(1) = Inf, where the integrand vanishes) and the tolerance is relaxed progressively
+#' instead of returning NA at the first warning of integrate().
+safe_int <- function(f, lo, hi) {
+  g <- function(x) { v <- f(x); v[!is.finite(v)] <- 0; v }
+  for (tol in c(1e-10, 1e-8, 1e-6, 1e-4)) {
+    r <- tryCatch(integrate(g, lo, hi, subdivisions = 5000L, rel.tol = tol, stop.on.error = FALSE),
+                  error = function(e) NULL)
+    if (!is.null(r) && is.finite(r$value) &&
+        (identical(r$message, "OK") || r$abs.error <= 1e-6 * max(1, abs(r$value)))) return(r$value)
+  }
+  NA_real_
+}
+
+make_dist <- function(family, ...) {
+  a <- list(...)
+  if (family == "gauss") {
+    list(id = "N(0,1)", family = family, tail_index = Inf, scale = 1,
+         r = function(n) rnorm(n), q = qnorm, d = dnorm, p = pnorm,
+         excess = function(q) dnorm(q) - q * pnorm(q, lower.tail = FALSE),
+         tail_int = function(fun, q) safe_int(function(x) fun(x) * dnorm(x), q, Inf))
+  } else if (family == "gpd") {
+    xi <- a$xi; sg <- if (is.null(a$sigma)) 1 else a$sigma
+    pf <- function(x) { x <- pmax(x, 0); 1 - (1 + xi * x / sg)^(-1 / xi) }
+    list(id = sprintf("GPD(%g)", xi), family = family, xi = xi, sigma = sg,
+         tail_index = 1 / xi, scale = sg,
+         r = function(n) sg / xi * (runif(n)^(-xi) - 1),
+         q = function(u) sg / xi * ((1 - u)^(-xi) - 1),
+         d = function(x) ifelse(x < 0, 0, (1 / sg) * (1 + xi * pmax(x, 0) / sg)^(-1 / xi - 1)),
+         p = pf,
+         excess = function(q) (1 - pf(q)) * (sg + xi * q) / (1 - xi),        # xi < 1
+         tail_int = function(fun, q) {                                       # v = P(X > x) = r e^{-t}
+           r <- 1 - pf(q)
+           safe_int(function(t) { v <- r * exp(-t); fun(sg / xi * (v^(-xi) - 1)) * v }, 0, Inf)
+         })
+  } else if (family == "stable") {
+    al <- a$alpha; be <- if (is.null(a$beta)) 0 else a$beta
+    ga <- if (is.null(a$gamma)) 1 else a$gamma; de <- if (is.null(a$zeta)) 0 else a$zeta
+    dfun <- function(x) suppressWarnings(stabledist::dstable(x, alpha = al, beta = be, gamma = ga, delta = de, pm = 0))
+    Kt <- (1 + be) * base::gamma(al) * sin(pi * al / 2) / pi * ga^al      # P(X > x) ~ Kt x^-alpha
+    list(id = sprintf("Stable(%g,%g)", al, be), family = family, alpha = al, beta = be, gamma = ga, zeta = de,
+         tail_index = if (al < 2) al else Inf, scale = ga,
+         r = function(n) stabledist::rstable(n, alpha = al, beta = be, gamma = ga, delta = de, pm = 0),
+         q = memo(function(u) stabledist::qstable(u, alpha = al, beta = be, gamma = ga, delta = de, pm = 0)),
+         d = dfun,
+         p = function(x) stabledist::pstable(x, alpha = al, beta = be, gamma = ga, delta = de, pm = 0),
+         excess = function(q) H_stable(q, al, be, ga, de),
+         tail_int = function(fun, q) {
+           L1 <- max(q, de) + 10 * ga; L <- max(q, de) + 200 * ga
+           safe_int(function(x) fun(x) * dfun(x), q, L1) + safe_int(function(x) fun(x) * dfun(x), L1, L) +
+             safe_int(function(x) fun(x) * al * Kt * (x - de)^(-al - 1), L, Inf)
+         })
+  } else stop("Unknown family: ", family)
+}
+
+dists <- list(make_dist("gauss"), make_dist("gpd", xi = 0.3), make_dist("gpd", xi = 0.8),
+              make_dist("stable", alpha = 1.5, beta = 0))
+names(dists) <- vapply(dists, `[[`, "", "id")
+file_id <- function(id) gsub("[^A-Za-z0-9.]+", "_", id)
+```
+
+## Theoretical quantities (corrected formulas)
+
+For $(F,\gamma,p)$, `truth()` returns $q=Q_p$, $\theta=\gamma'(SQ)$, $s=SQ_p^\gamma$ and
+
+* $\sigma^2=\mathrm{Var}\big((\gamma'(X)-\gamma'(q))_+\big)/\{(1-p)^2\gamma''(s)^2\}$: asymptotic variance of the empirical and undersmoothed kernel estimators;
+* $B'=\{\gamma''(q)f(q)+\int_q^\infty\gamma'''f\}/\{2(1-p)\gamma''(s)\}$: bias constant $B'h_n^2$ of the kernel estimator ($\mu_2=1$);
+* $A=\begin{pmatrix} f(q)&0\\ \gamma'(q)f(q)/(1-p)&1\end{pmatrix}$, $\Gamma=\begin{pmatrix}p(1-p)&p\theta\\ p\theta&\mathbb E[\gamma'(X)^2\mathbf 1_{\{X>q\}}]/(1-p)^2-\theta^2\end{pmatrix}$;
+* recursive variance $\Sigma_{22}/\gamma''(s)^2$, with $(\Lambda A-\tfrac I2)\Sigma+\Sigma(\Lambda A-\tfrac I2)^\top=\Lambda\Gamma\Lambda^\top$;
+  for Newton gains $\Lambda=A^{-1}$ it equals $\sigma^2$ (checked below);
+* **first-order bias of the recursive kernel estimator** (derived for this study): with $h_i=c\,i^{-a}$, $a<1/2$,
+  $\mathbb E\,(Q_n-q,\ \theta_n-\theta)\approx-(\Lambda A-2aI)^{-1}\Lambda\beta\,c^2n^{-2a}$,
+  $\beta=\big(f'(q)/2,\ \{\gamma''(q)f(q)+\gamma'(q)f'(q)\}/\{2(1-p)\}\big)$.
+
+```{r truth}
+lyap_solve <- function(Lambda, A, Gamma) {
+  if (any(!is.finite(Gamma)) || any(!is.finite(A)) || any(!is.finite(Lambda))) return(matrix(NA_real_, 2, 2))
+  Mx <- Lambda %*% A - diag(2) / 2
+  if (any(Re(eigen(Mx, only.values = TRUE)$values) <= 0)) return(matrix(NA_real_, 2, 2))
+  L <- kronecker(diag(2), Mx) + kronecker(Mx, diag(2))
+  matrix(solve(L, as.vector(Lambda %*% Gamma %*% t(Lambda))), 2, 2)
+}
+
+.tcache <- new.env()
+truth <- function(dist, gen, p) {
+  key <- paste(dist$id, gen$name, format(p), sep = "|")
+  if (exists(key, envir = .tcache, inherits = FALSE)) return(get(key, envir = .tcache))
+  r <- 1 - p; q <- dist$q(p); f <- dist$d(q)
+  e <- 1e-3 * max(1, abs(q)); fp <- (dist$d(q + e) - dist$d(q - e)) / (2 * e)
+  gq <- gen$g1(q)
+  theta <- if (gen$name == "quad") q + dist$excess(q) / r else dist$tail_int(gen$g1, q) / r
+  s <- gen$ginv(theta); g2s <- gen$g2(s)
+  applies <- (gen$growth == "log") || (dist$tail_index > 2)
+  mc  <- r * (theta - gq)
+  m2c <- if (applies) dist$tail_int(function(x) (gen$g1(x) - gq)^2, q) else Inf
+  VT  <- (m2c - mc^2) / r^2
+  I3 <- if (gen$name == "quad") 0 else dist$tail_int(gen$g3, q)
+  Bprime <- (gen$g2(q) * f + I3) / (2 * r * g2s)
+  A <- matrix(c(f, gq * f / r, 0, 1), 2, 2)
+  m2 <- m2c + 2 * gq * mc + gq^2 * r
+  Gam <- matrix(c(p * r, p * theta, p * theta, m2 / r^2 - theta^2), 2, 2)
+  S_newt <- lyap_solve(solve(A), A, Gam)
+  out <- list(dist = dist$id, gen = gen$name, p = p, q = q, f = f, fp = fp, theta = theta, s = s, g2s = g2s,
+              applies = applies, VT = VT, sigma2 = if (applies) VT / g2s^2 else Inf, Bprime = Bprime,
+              A = A, Gamma = Gam, beta_rec = c(fp / 2, (gen$g2(q) * f + gq * fp) / (2 * r)),
+              var_rec_newton = if (applies) S_newt[2, 2] / g2s^2 else Inf,
+              regime = if (applies) "regular (CLT)" else "non-regular (Var = Inf)")
+  if (applies && !is.finite(out$sigma2)) warning("Non-finite asymptotic variance for ", key, ": check the tail integrals.")
+  assign(key, out, envir = .tcache)
+  out
+}
+
+rec_bias_theory <- function(tr, a, n, c = 1) {              # Newton gains Lambda = A^-1
+  if (!is.finite(a) || a >= 0.5 || any(!is.finite(tr$beta_rec))) return(NA_real_)
+  Lam <- solve(tr$A)
+  K <- -solve(Lam %*% tr$A - 2 * a * diag(2), Lam %*% tr$beta_rec)
+  K[2] * c^2 * n^(-2 * a) / tr$g2s
+}
+pop_scale <- function(dist, cfg) if (cfg$h_scale == "robust") (dist$q(0.75) - dist$q(0.25)) / 1.349 else 1
+
+#' Theoretical standard deviation and bias of an estimator (method, a, n).
+theory_for <- function(tr, method, a, n, c = 1) {
+  sd_b <- sqrt(tr$sigma2 / n)
+  switch(method,
+    emp        = c(sd = sd_b, bias = 0),
+    ker        = c(sd = sd_b, bias = tr$Bprime * (c * n^(-a))^2),
+    rec_ind    = c(sd = sd_b, bias = 0),
+    rec_ker    = c(sd = sd_b, bias = rec_bias_theory(tr, a, n, c)),
+    rec_pr     = c(sd = sd_b, bias = NA_real_),
+    c(sd = NA_real_, bias = NA_real_))
+}
+```
+
+## Estimators
+
+Batch estimators are **vectorised over the rows** of a matrix of samples (one row = one replication).
+The recursive engine updates all variants (all $a$, indicator, Polyak–Ruppert) **in a single pass**, with Newton gains:
+$$Q_{i}=Q_{i-1}-a_i\,\hat g_q\,(W_i-p),\qquad
+\theta_{i}=\theta_{i-1}-a_i\Big[\theta_{i-1}-\tfrac{\gamma'(X_i)(1-W_i)}{1-p}-\tfrac{\gamma'(Q_{i-1})(W_i-p)}{1-p}\Big],$$
+$a_i=1/i$ (`rec_ind`, `rec_ker`) or $a_i=i^{-\rho}$, $\rho=$ `rho_pr` $=0.8$, followed by the average $\bar\theta_n=\frac1{n-n_0}\sum_{i>n_0}\theta_i$ (`rec_pr`),
+and $\hat g_q=1/\hat f(Q_{n_0})$ from an empirical warm start on $n_0$ observations.
+
+```{r estimators}
+robust_scale <- function(x) {
+  s <- IQR(x) / 1.349
+  if (!is.finite(s) || s <= 0) s <- sd(x)
+  if (!is.finite(s) || s <= 0) s <- 1
+  s
+}
+sort_rows <- function(X) { S <- t(apply(X, 1, sort)); if (nrow(X) == 1) S <- matrix(S, 1); S }
+col_name <- function(method, a, n) paste(method, if (is.na(a)) "NA" else as.character(a), n, sep = "|")
+
+est_emp_rows <- function(Xs, p, gen) {
+  m <- ncol(Xs); r <- 1 - p; k <- ceiling(m * p - 1e-9)
+  q <- Xs[, k]
+  up <- if (k < m) rowSums(gen$g1(Xs[, (k + 1):m, drop = FALSE])) else 0
+  Tn <- ((k - m * p) * gen$g1(q) + up) / (m * r)
+  list(est = gen$ginv(Tn), q = q, T = Tn)
+}
+
+kernel_quantile <- function(x, p, h, start = NULL) {
+  if (is.null(start)) start <- unname(quantile(x, p, type = 1))
+  t <- start
+  for (it in 1:30) {
+    z <- (t - x) / h
+    Fv <- mean(pnorm(z)) - p; dv <- mean(dnorm(z)) / h
+    if (!is.finite(dv) || dv < 1e-12) break
+    stp <- Fv / dv; t <- t - stp
+    if (!is.finite(t)) break
+    if (abs(stp) < 1e-10 * (1 + abs(t))) return(t)
+  }
+  tryCatch(uniroot(function(t) mean(pnorm((t - x) / h)) - p, range(x) + c(-8, 8) * h, tol = 1e-12)$root,
+           error = function(e) NA_real_)
+}
+
+est_kernel <- function(x, p, gen, h, qh = NULL) {
+  r <- 1 - p; n <- length(x)
+  if (is.null(qh)) qh <- kernel_quantile(x, p, h)
+  if (!is.finite(qh)) return(list(est = NA_real_, q = NA_real_, T = NA_real_))
+  a <- (qh - x) / h
+  if (gen$name == "quad") {
+    Tn <- sum(x * pnorm(-a) + h * dnorm(a)) / (n * r)
+  } else {
+    far <- a < -8; band <- abs(a) <= 8
+    s_far <- sum(gen$g1(x[far]) + h^2 / 2 * gen$g3(x[far]))
+    ab <- a[band]; half <- (8 - ab) / 2; mid <- (8 + ab) / 2
+    Z <- outer(half, .GL40$x) + mid
+    vals <- gen$g1(x[band] + h * Z) * dnorm(Z)
+    s_band <- sum(drop(vals %*% .GL40$w) * half)
+    Tn <- (s_far + s_band) / (n * r)
+  }
+  list(est = gen$ginv(Tn), q = qh, T = Tn)
+}
+
+warm_start_rows <- function(X, p, gen, n0) {
+  X0 <- X[, seq_len(n0), drop = FALSE]
+  e0 <- est_emp_rows(sort_rows(X0), p, gen)
+  s0 <- apply(X0, 1, robust_scale)
+  hp <- s0 * n0^(-0.2)
+  fq <- rowMeans(dnorm((e0$q - X0) / hp)) / hp
+  fq <- pmax(fq, 0.1 * (1 - p) / s0)
+  list(n0 = n0, Q = e0$q, T = e0$T, s0 = s0, gq = 1 / fq)
+}
+
+#' Vectorised recursive engine (replications x variants), Newton gains for every variant.
+#' a_ker: bandwidth exponents of the step-1/i kernel recursions; a_pr: exponents of the
+#' Polyak-Ruppert recursions (step i^-0.7, averaged iterates); ind: indicator recursion.
+rec_engine <- function(X, GX, p, gen, ws, a_ker, a_pr = numeric(0), rec_at, h_scale = "none", ind = TRUE,
+                       rho_pr = get0("cfg", ifnotfound = list(rho_pr = 0.8))$rho_pr) {
+  B <- nrow(X); n <- ncol(X); r <- 1 - p
+  avec <- c(a_ker, a_pr); rho <- c(rep(1, length(a_ker)), rep(rho_pr, length(a_pr)))
+  Kk <- length(avec); idx_pr <- which(rho < 1); any_pr <- length(idx_pr) > 0
+  cn <- c(paste0("rec_ker|", as.character(a_ker)),
+          if (any_pr) paste0("rec_pr|", as.character(a_pr)), "rec_ind|NA")
+  Qk <- matrix(ws$Q, B, Kk); Tk <- matrix(ws$T, B, Kk); Qi <- ws$Q; Ti <- ws$T; gq <- ws$gq
+  Tbar <- Tk[, idx_pr, drop = FALSE]; nb_avg <- 0L
+  Cvec <- if (h_scale == "robust") rep(ws$s0, Kk) else rep(1, B * Kk)
+  rec_at <- sort(unique(rec_at[rec_at > ws$n0 & rec_at <= n]))
+  outT <- outQ <- vector("list", length(rec_at)); j <- 1L
+  for (i in (ws$n0 + 1L):n) {
+    xi <- X[, i]; gi <- GX[, i]
+    ak <- rep(i^(-rho), each = B)
+    Wk <- pnorm((Qk - xi) / (Cvec * rep(i^(-avec), each = B)))
+    dT <- Tk - gi * (1 - Wk) / r - gen$g1(Qk) * (Wk - p) / r
+    Tk <- Tk - ak * dT
+    Qk <- Qk - ak * gq * (Wk - p)
+    if (any_pr) { nb_avg <- nb_avg + 1L; Tbar <- Tbar + (Tk[, idx_pr, drop = FALSE] - Tbar) / nb_avg }
+    if (ind) {
+      Wi <- as.numeric(xi <= Qi)
+      Ti <- Ti - (Ti - gi * (1 - Wi) / r - gen$g1(Qi) * (Wi - p) / r) / i
+      Qi <- Qi - gq * (Wi - p) / i
+    }
+    if (j <= length(rec_at) && i == rec_at[j]) {
+      Tout <- Tk; if (any_pr) Tout[, idx_pr] <- Tbar
+      outT[[j]] <- `colnames<-`(cbind(Tout, Ti), cn); outQ[[j]] <- `colnames<-`(cbind(Qk, Qi), cn)
+      j <- j + 1L
+    }
+  }
+  list(n = rec_at, T = outT, Q = outQ)
+}
+
+se_batch <- function(x, p, gen, q, s) {
+  z <- pmax(gen$g1(x) - gen$g1(q), 0)
+  sqrt(var(z) / (1 - p)^2 / gen$g2(s)^2 / length(x))
+}
+```
+
+## Utilities (parallelism, figures, LaTeX tables)
+
+```{r utils}
+par_map <- function(X, FUN, cores = 1) {
+  res <- if (cores > 1) parallel::mclapply(X, FUN, mc.cores = cores, mc.preschedule = FALSE) else lapply(X, FUN)
+  bad <- vapply(res, function(r) inherits(r, "try-error") || inherits(r, "error"), logical(1))
+  if (any(bad)) stop("A parallel task failed: ", as.character(res[[which(bad)[1]]]))
+  res
+}
+meth_lab <- c(emp = "Empirical (batch)", ker = "Kernel (batch)", rec_ind = "Recursive indicator (Newton gains)",
+              rec_ker = sprintf("Recursive kernel (Newton gains), h = n^-%g", cfg$a_default),
+              rec_ker04 = sprintf("Recursive kernel (Newton gains), h = n^-%g", cfg$a_rec_ref),
+              rec_pr = sprintf("Recursive kernel, n^-%g + PR averaging, h = n^-%g", cfg$rho_pr, cfg$a_default),
+              rec_pr04 = sprintf("Recursive kernel, n^-%g + PR averaging, h = n^-%g", cfg$rho_pr, cfg$a_rec_ref))
+meth_col <- setNames(c("#D55E00", "#009E73", "black", "#0072B2", "#56B4E9", "#CC79A7", "#E69F00"), meth_lab)
+#' Reference-estimator key of a (method, a) column: rec_ker / rec_pr at a_default and a_rec_ref.
+ref_key <- function(method, a) {
+  near <- function(x, y) !is.na(x) & abs(x - y) < 1e-12
+  out <- ifelse(method %in% c("emp", "ker", "rec_ind"), method, NA_character_)
+  out[method == "rec_ker" & near(a, cfg$a_default)] <- "rec_ker"
+  out[method == "rec_ker" & near(a, cfg$a_rec_ref)] <- "rec_ker04"
+  out[method == "rec_pr" & near(a, cfg$a_default)] <- "rec_pr"
+  out[method == "rec_pr" & near(a, cfg$a_rec_ref)] <- "rec_pr04"
+  out
+}
+#' Inverse map: key -> (method, a).
+key_method <- function(k) sub("04$", "", k)
+key_a <- function(k) ifelse(k %in% c("emp", "rec_ind"), NA_real_, ifelse(grepl("04$", k), cfg$a_rec_ref, cfg$a_default))
+theme_article <- function(base = 15)
+  theme_bw(base_size = base) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank(), legend.key.width = grid::unit(1.4, "cm"))
+save_fig <- function(plot, name, width = 14, height = 8) {
+  ggsave(file.path(cfg$out, "figures", paste0(name, ".pdf")), plot, width = width, height = height,
+         units = "in", limitsize = FALSE, device = if (capabilities("cairo")) cairo_pdf else "pdf")
+  invisible(plot)
+}
+#' Prints and saves a ggplot only when its data are non-empty
+#' (avoids "Faceting variables must have at least one value").
+emit_plot <- function(plot, data, name, width = 14, height = 8) {
+  if (is.null(data) || NROW(data) == 0) { message("No data for figure '", name, "': skipped."); return(invisible(NULL)) }
+  print(plot); save_fig(plot, name, width, height)
+}
+latex_escape <- function(s) gsub("([_%&#$])", "\\\\\\1", s)
+#' Writes a booktabs LaTeX table to out/tables/<name>.tex (label tab:<label>) and displays it.
+save_latex <- function(df, name, caption, label = name, digits = 3) {
+  tex <- knitr::kable(df, format = "latex", booktabs = TRUE, digits = digits, caption = latex_escape(caption),
+                      label = label, linesep = "", row.names = FALSE)
+  writeLines(tex, file.path(cfg$out, "tables", paste0(name, ".tex")))
+  knitr::kable(df, digits = digits, caption = caption, row.names = FALSE)
+}
+pfile <- function(p) gsub("\\.", "_", sprintf("%.2f", p))
+winsor_by <- function(v, g, probs = c(0.005, 0.995))
+  ave(v, g, FUN = function(z) { qq <- quantile(z, probs, na.rm = TRUE); pmin(pmax(z, qq[1]), qq[2]) })
+```
+
+# Preliminary checks (exact formulas)
+
+Each check is reported as `PASS`, `FAIL` or `NA`; a non-finite value is reported, never turned into an error.
+
+```{r selfcheck}
+selfcheck <- function() {
+  chk <- list()
+  add <- function(name, value, target, tol) {
+    err <- abs(value - target) / max(abs(target), 1e-12)
+    chk[[length(chk) + 1]] <<- data.frame(Check = name, Value = value, Target = target, `Relative error` = err,
+      Tolerance = tol, Status = if (!is.finite(err)) "NA" else if (err <= tol) "PASS" else "FAIL", check.names = FALSE)
+  }
+  N <- dists[["N(0,1)"]]; G3 <- dists[["GPD(0.3)"]]; S15 <- dists[["Stable(1.5,0)"]]
+  add("Gaussian CVaR, p = 0.95: phi(q)/(1-p)", truth(N, gens$quad, 0.95)$s, dnorm(qnorm(0.95)) / 0.05, 1e-8)
+  q3 <- G3$q(0.95)
+  add("GPD(0.3) quadratic SQ: (sigma + q)/(1 - xi)", truth(G3, gens$quad, 0.95)$s, (1 + q3) / 0.7, 1e-8)
+  add("GPD(0.3) quadratic SQ by tail integration", q3 + G3$tail_int(function(x) x - q3, q3) / 0.05, (1 + q3) / 0.7, 1e-6)
+  add("Stable H, alpha = 2: E[X^+] = 1/sqrt(pi)", H_stable(0, 2, 0), 1 / sqrt(pi), 1e-6)
+  qs <- S15$q(0.95)
+  add("Stable(1.5,0): H = density quadrature", H_stable(qs, 1.5, 0), S15$tail_int(function(x) x - qs, qs), 5e-3)
+  add("Stable(1.5,0.5): H = density quadrature", H_stable(1, 1.5, 0.5),
+      make_dist("stable", alpha = 1.5, beta = 0.5)$tail_int(function(x) x - 1, 1), 5e-3)
+  set.seed(1); x <- rnorm(5000); qn <- gens$quad; qn$name <- "quad_numeric"
+  add("Kernel estimator: closed form = quadrature", est_kernel(x, 0.95, gens$quad, 0.1)$est,
+      est_kernel(x, 0.95, qn, 0.1)$est, 1e-6)
+  for (g in names(gens)) {
+    tr <- truth(N, gens[[g]], 0.95)
+    add(paste0("Newton gains: recursive variance = sigma^2 [", g, "]"), tr$var_rec_newton, tr$sigma2, 1e-8)
+  }
+  tr <- truth(N, gens$quad, 0.95)
+  add("Recursive bias, fixed h: -(A^-1 beta)_2 = -f(q)/(2(1-p))", -solve(tr$A, tr$beta_rec)[2], -tr$f / 0.1, 1e-8)
+  h <- 0.05
+  add("Exact fixed point of the recursion (N(0,1), h = 0.05) vs first order",
+      tr$theta / sqrt(1 + h^2) - tr$theta, -tr$f / 0.1 * h^2, 3e-3)
+  set.seed(2); y <- rexp(20000); ge <- gens$asinh
+  add("Empirical asinh SQ, Exp(1), p = 0.5, n = 20000", est_emp_rows(sort_rows(matrix(y, 1)), 0.5, ge)$est,
+      ge$ginv(integrate(function(t) asinh(t) * exp(-t), log(2), Inf)$value / 0.5), 0.02)
+  do.call(rbind, chk)
+}
+sc <- selfcheck()
+kable(sc, digits = 6, caption = "Preliminary checks of the exact formulas")
+if (any(sc$Status != "PASS")) warning("Checks not passed: ", paste(sc$Check[sc$Status != "PASS"], collapse = "; "))
+```
+
+# Theoretical values of the scenarios
+
+```{r truth-table}
+TR <- list(); rows <- list()
+for (d in dists) for (g in names(gens)) for (p in cfg$p_levels) {
+  tr <- truth(d, gens[[g]], p); TR[[paste(d$id, g, p, sep = "|")]] <- tr
+  rows[[length(rows) + 1]] <- data.frame(
+    Distribution = d$id, Generator = gen_lab[[g]], p = p, Regime = tr$regime, `Q_p` = tr$q, `SQ_p` = tr$s,
+    sigma2 = tr$sigma2, `B'` = tr$Bprime,
+    `Rec. bias at n` = rec_bias_theory(tr, cfg$a_default, cfg$n, pop_scale(d, cfg)),
+    check.names = FALSE)
+}
+truth_tab <- do.call(rbind, rows)
+write.csv(truth_tab, file.path(cfg$out, "truth_table.csv"), row.names = FALSE)
+save_latex(truth_tab, "truth_table", digits = 4,
+  caption = "Quantiles, Bregman superquantiles, efficient asymptotic variance sigma^2 (shared by the batch estimators and by the recursive estimators with Newton gains or averaging), bias constant B' and first-order bias of the recursive kernel estimator at the final sample size.")
+```
+
+Newton gains (or averaging) are needed to reach the batch variance $\sigma^2$ (Corollary 3.4); with these
+gains all estimators of the study share the asymptotic variance $\sigma^2$.
+
+# Main experiment (objectives 1 to 3)
+
+```{r main-engine}
+run_block <- function(d, di, b, cfg, gens) {
+  set.seed(cfg$seed + 100003L * di + b)
+  B <- cfg$block; n <- cfg$n; P <- cfg$p_levels; grid <- cfg$n_grid
+  X <- matrix(d$r(B * n), B, n)
+  keys <- as.vector(outer(names(gens), P, paste, sep = "|"))
+  res <- setNames(lapply(keys, function(k) list()), keys)
+  for (m in grid) {
+    Xm <- X[, seq_len(m), drop = FALSE]; Xs <- sort_rows(Xm)
+    hm <- (if (cfg$h_scale == "robust") apply(Xm, 1, robust_scale) else rep(1, B)) * m^(-cfg$a_default)
+    for (p in P) {
+      kq <- ceiling(m * p - 1e-9)
+      qh <- vapply(seq_len(B), function(i) kernel_quantile(Xm[i, ], p, hm[i], start = Xs[i, kq]), numeric(1))
+      for (g in names(gens)) {
+        gen <- gens[[g]]; key <- paste(g, p, sep = "|")
+        e <- est_emp_rows(Xs, p, gen)
+        kest <- gen$ginv(vapply(seq_len(B), function(i) est_kernel(Xm[i, ], p, gen, hm[i], qh = qh[i])$T, numeric(1)))
+        res[[key]][[col_name("emp", NA, m)]] <- e$est
+        res[[key]][[col_name("ker", cfg$a_default, m)]] <- kest
+        if (m == n) {
+          res[[key]][["se:emp"]] <- vapply(seq_len(B), function(i) se_batch(Xm[i, ], p, gen, e$q[i], e$est[i]), numeric(1))
+          res[[key]][["se:ker"]] <- vapply(seq_len(B), function(i) se_batch(Xm[i, ], p, gen, qh[i], kest[i]), numeric(1))
+        }
+      }
+    }
+  }
+  for (g in names(gens)) {
+    gen <- gens[[g]]; GX <- gen$g1(X)
+    for (p in P) {
+      key <- paste(g, p, sep = "|")
+      ws <- warm_start_rows(X, p, gen, n0_rule(p))
+      rr <- rec_engine(X, GX, p, gen, ws, cfg$a_rec, cfg$a_pr, grid, cfg$h_scale)   # Newton + PR
+      for (j in seq_along(rr$n)) for (cc in colnames(rr$T[[j]])) {
+        sp <- strsplit(cc, "|", fixed = TRUE)[[1]]
+        res[[key]][[paste(sp[1], sp[2], rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, cc])
+      }
+      J <- length(rr$n); Tf <- rr$T[[J]]; Qf <- rr$Q[[J]]
+      ad <- as.character(cfg$a_default); ar <- as.character(cfg$a_rec_ref)
+      for (mm in list(c("rec_ind", "NA", "rec_ind"), c("rec_ker", ad, "rec_ker"), c("rec_pr", ad, "rec_pr"),
+                      c("rec_ker", ar, "rec_ker04"), c("rec_pr", ar, "rec_pr04"))) {   # plug-in sigma (efficient gains)
+        cc <- paste(mm[1], mm[2], sep = "|")
+        res[[key]][[paste0("se:", mm[3])]] <- vapply(seq_len(B), function(i)
+          se_batch(X[i, ], p, gen, Qf[i, cc], gen$ginv(Tf[i, cc])), numeric(1))
+      }
+    }
+  }
+  lapply(res, function(l) do.call(cbind, l))
+}
+
+run_main <- function(cfg, dists, gens) {
+  nb <- cfg$M %/% cfg$block; out <- list()
+  for (di in seq_along(dists)) {
+    d <- dists[[di]]
+    f <- file.path(cfg$out, sprintf("main3_%s_n%d_B%d.rds", file_id(d$id), cfg$n, cfg$block))
+    st <- if (file.exists(f)) readRDS(f) else list(done = integer(0), res = NULL)
+    todo <- setdiff(seq_len(nb), st$done)
+    if (length(todo)) {
+      chunks <- split(todo, ceiling(seq_along(todo) / cfg$cores))
+      for (ch in chunks) {
+        t0 <- proc.time()[["elapsed"]]
+        rl <- par_map(ch, function(b) run_block(d, di, b, cfg, gens), cfg$cores)
+        for (r in rl) st$res <- if (is.null(st$res)) r else Map(rbind, st$res, r)
+        st$done <- c(st$done, ch); saveRDS(st, f)
+        msg <- sprintf("[%s] %s: blocks %s done (%d/%d), %.0f s", format(Sys.time(), "%H:%M:%S"), d$id,
+                       paste(ch, collapse = ","), length(st$done), nb, proc.time()[["elapsed"]] - t0)
+        cat(msg, "\n", file = stderr())                                            # visible during knitting
+        cat(msg, "\n", file = file.path(cfg$out, "progress.log"), append = TRUE)
+      }
+    }
+    keep <- seq_len(min(cfg$M, nrow(st$res[[1]])))
+    out[[d$id]] <- lapply(st$res, function(Mx) Mx[keep, , drop = FALSE])
+  }
+  out
+}
+```
+
+```{r main-run, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main)}
+t_main <- system.time(MAIN <- run_main(cfg, dists, gens))
+message(sprintf("Main experiment: %.1f min", t_main[["elapsed"]] / 60))
+```
+
+## Monte Carlo summaries
+
+```{r main-summary, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main)}
+parse_cols <- function(cn) {
+  sp <- strsplit(cn, "|", fixed = TRUE)
+  data.frame(col = cn, method = vapply(sp, `[`, "", 1),
+             a = suppressWarnings(as.numeric(vapply(sp, `[`, "", 2))),
+             n = as.integer(vapply(sp, `[`, "", 3)), stringsAsFactors = FALSE)
+}
+ks_stat <- function(z) if (length(z) > 10) unname(suppressWarnings(ks.test(z, "pnorm")$statistic)) else NA_real_
+
+#' Columns of the reference estimators at the final sample size.
+ref_cols <- function(cfg) {
+  k <- names(meth_lab)
+  setNames(vapply(k, function(x) col_name(key_method(x), key_a(x), cfg$n), ""), k)
+}
+summarise_main <- function(MAIN, cfg) {
+  rows <- list(); cov_rows <- list()
+  for (dn in names(MAIN)) for (key in names(MAIN[[dn]])) {
+    Mx <- MAIN[[dn]][[key]]; g <- sub("\\|.*", "", key); p <- as.numeric(sub(".*\\|", "", key))
+    tr <- TR[[paste(dn, g, p, sep = "|")]]; cpop <- pop_scale(dists[[dn]], cfg)
+    pc <- parse_cols(colnames(Mx)[!startsWith(colnames(Mx), "se:")])
+    for (j in seq_len(nrow(pc))) {
+      v <- Mx[, pc$col[j]]; v <- v[is.finite(v)]; e <- v - tr$s
+      th <- theory_for(tr, pc$method[j], pc$a[j], pc$n[j], cpop)
+      ok_th <- is.finite(th[["sd"]]) && th[["sd"]] > 0
+      bth <- if (is.finite(th[["bias"]])) th[["bias"]] else 0
+      rows[[length(rows) + 1]] <- data.frame(
+        dist = dn, gen = g, p = p, regime = tr$regime, method = pc$method[j], a = pc$a[j], n = pc$n[j],
+        est_key = ref_key(pc$method[j], pc$a[j]),
+        M_ok = length(v), truth = tr$s, bias = mean(e), mcse_bias = sd(e) / sqrt(length(e)), sd = sd(e),
+        rmse = sqrt(mean(e^2)), rel_bias = mean(e) / abs(tr$s), rel_rmse = sqrt(mean(e^2)) / abs(tr$s),
+        median_abs_err = median(abs(e)), sd_theory = th[["sd"]], bias_theory = th[["bias"]],
+        rmse_theory = sqrt(th[["sd"]]^2 + bth^2),
+        ks = if (ok_th) ks_stat(e / th[["sd"]]) else NA_real_,
+        ks_bias_corrected = if (ok_th) ks_stat((e - bth) / th[["sd"]]) else NA_real_)
+    }
+    map <- ref_cols(cfg)
+    for (m in names(map)) {
+      est <- Mx[, map[[m]]]; se <- Mx[, paste0("se:", m)]; ok <- is.finite(est) & is.finite(se)
+      cov_rows[[length(cov_rows) + 1]] <- data.frame(
+        dist = dn, gen = g, p = p, regime = tr$regime, method = m, M_ok = sum(ok),
+        coverage = if (any(ok)) mean(abs(est[ok] - tr$s) <= 1.96 * se[ok]) else NA_real_,
+        mean_length = if (any(ok)) mean(2 * 1.96 * se[ok]) else NA_real_,
+        sd_mc = if (sum(ok) > 1) sd(est[ok]) else NA_real_, mean_se = if (any(ok)) mean(se[ok]) else NA_real_)
+    }
+  }
+  list(summ = do.call(rbind, rows), cov = do.call(rbind, cov_rows))
+}
+SUMM <- summarise_main(MAIN, cfg)
+summ <- SUMM$summ; covt <- SUMM$cov
+summ$method_lab <- factor(unname(meth_lab[summ$est_key]), levels = meth_lab)
+covt$method_lab <- factor(meth_lab[covt$method], levels = meth_lab)
+summ$gen_lab <- factor(gen_lab[summ$gen], levels = gen_lab); covt$gen_lab <- factor(gen_lab[covt$gen], levels = gen_lab)
+write.csv(summ, file.path(cfg$out, "main_summary.csv"), row.names = FALSE)
+write.csv(covt, file.path(cfg$out, "main_coverage.csv"), row.names = FALSE)
+
+final_long <- function(MAIN, cfg) {
+  map <- ref_cols(cfg)
+  do.call(rbind, lapply(names(MAIN), function(dn) do.call(rbind, lapply(names(MAIN[[dn]]), function(key) {
+    Mx <- MAIN[[dn]][[key]]; g <- sub("\\|.*", "", key); p <- as.numeric(sub(".*\\|", "", key))
+    tr <- TR[[paste(dn, g, p, sep = "|")]]
+    do.call(rbind, lapply(names(map), function(m) data.frame(
+      dist = dn, gen = gen_lab[[g]], p = p, method = meth_lab[[m]], rep = seq_len(nrow(Mx)),
+      est = Mx[, map[[m]]], truth = tr$s)))
+  }))))
+}
+FL <- final_long(MAIN, cfg)
+FL$rel_err <- (FL$est - FL$truth) / abs(FL$truth)
+FL$method <- factor(FL$method, levels = meth_lab)
+FL$dist <- factor(FL$dist, levels = names(dists))
+FL$gen <- factor(FL$gen, levels = gen_lab)
+## reference estimators only (rec_ker and rec_pr at a_default and a_rec_ref)
+ref_methods <- function(d) d %>% filter(!is.na(est_key))
+```
+
+## Objective 1: finite-sample accuracy
+
+```{r obj1-table, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main)}
+tab1 <- ref_methods(summ) %>% filter(n == cfg$n) %>%
+  transmute(Distribution = dist, Generator = gen_lab, p, Regime = regime, Method = method_lab, `True SQ` = truth,
+            Bias = bias, `MC s.e. (bias)` = mcse_bias, SD = sd, RMSE = rmse, `Rel. bias` = rel_bias,
+            `Rel. RMSE` = rel_rmse, `Asympt. SD` = sd_theory) %>%
+  arrange(p, Distribution, Generator, Method)
+save_latex(tab1, "accuracy_final_n", digits = 4,
+  caption = sprintf("Finite-sample accuracy at n = %d (M = %d replications). Asympt. SD: square root of the asymptotic variance divided by n.", cfg$n, cfg$M))
+```
+
+**Relative estimation errors (Figure 5 of the article).** $(\widehat{SQ}-SQ)/|SQ|$ makes the two generators comparable
+(their targets differ). Values are winsorised at 0.5%/99.5% per panel for readability only; tables use raw values.
+
+```{r obj1-rel, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main), fig.width = 16, fig.height = 10}
+for (pp in cfg$p_levels) {
+  d <- FL %>% filter(p == pp, is.finite(rel_err))
+  if (nrow(d)) d$y <- winsor_by(d$rel_err, d$dist)
+  pl <- ggplot(d, aes(method, y, fill = gen)) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey35") +
+    geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.35, linewidth = 0.4, position = position_dodge(0.8), width = 0.7) +
+    facet_wrap(~ dist, ncol = 2, scales = "free_y") + scale_fill_brewer(palette = "Set2") +
+    labs(x = NULL, y = "(Estimate - true value) / |true value|", fill = "Generator",
+         title = sprintf("Relative estimation errors (p = %.2f)", pp),
+         subtitle = sprintf("n = %d, M = %d replications. Dashed line: zero error.", cfg$n, cfg$M)) +
+    theme_article() + theme(axis.text.x = element_text(angle = 25, hjust = 1))
+  emit_plot(pl, d, paste0("fig_relative_error_p_", pfile(pp)), 16, 10)
+}
+```
+
+```{r obj1-raw, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main), fig.width = 20, fig.height = 9}
+for (pp in cfg$p_levels) {
+  d <- FL %>% filter(p == pp, is.finite(est))
+  if (nrow(d)) d$y <- winsor_by(d$est, interaction(d$dist, d$gen))
+  tv <- distinct(d, dist, gen, truth)
+  pl <- ggplot(d, aes(method, y, fill = method)) +
+    geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.35, linewidth = 0.4) +
+    geom_hline(data = tv, aes(yintercept = truth), linetype = 2) +
+    facet_grid(gen ~ dist, scales = "free_y") + scale_fill_manual(values = meth_col) +
+    labs(x = NULL, y = "Final estimate", fill = NULL,
+         title = sprintf("Final estimates (n = %d, M = %d, p = %.2f)", cfg$n, cfg$M, pp),
+         subtitle = "Dashed line: true Bregman superquantile") +
+    theme_article() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    guides(fill = guide_legend(nrow = 3))
+  emit_plot(pl, d, paste0("fig_raw_estimates_p_", pfile(pp)), 20, 9)
+}
+```
+
+## Objective 2a: consistency ($\mathrm{RMSE}\propto n^{-1/2}$)
+
+Dashed curves: theoretical RMSE $\sqrt{\mathrm{sd}_{th}^2+\text{bias}_{th}^2}$ (regular regime). In the non-regular
+regime the slope is expected to be flatter than $-1/2$.
+
+```{r obj2-consistency, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main), fig.width = 18, fig.height = 10}
+cons <- ref_methods(summ)
+slopes <- cons %>% filter(is.finite(rmse), rmse > 0) %>% group_by(dist, gen_lab, p, regime, method_lab) %>%
+  filter(n() >= 2) %>% summarise(slope = unname(coef(lm(log(rmse) ~ log(n)))[2]), .groups = "drop")
+write.csv(slopes, file.path(cfg$out, "consistency_slopes.csv"), row.names = FALSE)
+save_latex(slopes %>% pivot_wider(names_from = method_lab, values_from = slope) %>%
+             rename(Distribution = dist, Generator = gen_lab, Regime = regime), "consistency_slopes",
+           caption = "Slope of log RMSE against log n (expected value -0.5 in the regular regime).")
+for (pp in cfg$p_levels) {
+  d <- cons %>% filter(p == pp, is.finite(rmse), rmse > 0)
+  pl <- ggplot(d, aes(n, rmse, colour = method_lab, shape = method_lab)) +
+    geom_point(size = 2.5) + geom_line(linewidth = 0.9) +
+    geom_line(data = d %>% filter(is.finite(rmse_theory)), aes(y = rmse_theory), linetype = 2, linewidth = 0.7) +
+    scale_x_log10() + scale_y_log10() + facet_wrap(~ dist + gen_lab, scales = "free_y", ncol = 4) +
+    scale_colour_manual(values = meth_col) +
+    labs(x = "Sample size n (log scale)", y = "RMSE (log scale)", colour = NULL, shape = NULL,
+         title = sprintf("Consistency: RMSE versus sample size (p = %.2f)", pp),
+         subtitle = "Solid: Monte Carlo; dashed: asymptotic theory (regular regime)") + theme_article(13)
+  emit_plot(pl, d, paste0("fig_consistency_p_", pfile(pp)), 18, 10)
+}
+```
+
+## Objective 2b: asymptotic variances and coverage
+
+```{r obj2-var, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main), fig.width = 18, fig.height = 7}
+vr <- cons %>% filter(n == cfg$n, regime == "regular (CLT)", is.finite(sd_theory)) %>% mutate(ratio = (sd / sd_theory)^2)
+save_latex(vr %>% select(dist, gen_lab, p, method_lab, ratio) %>%
+             pivot_wider(names_from = method_lab, values_from = ratio) %>% rename(Distribution = dist, Generator = gen_lab),
+           "variance_ratio", caption = "Ratio of n times the Monte Carlo variance to the theoretical asymptotic variance (expected value 1).")
+pl <- ggplot(vr, aes(factor(p), ratio, colour = method_lab)) +
+  geom_hline(yintercept = 1, linetype = 2) + geom_point(size = 3, position = position_dodge(0.5)) +
+  facet_wrap(~ dist + gen_lab, nrow = 1) + scale_colour_manual(values = meth_col) +
+  labs(x = "p", y = "n Var(MC) / theoretical variance", colour = NULL,
+       title = "Asymptotic variances: Monte Carlo versus theory") + theme_article(13)
+emit_plot(pl, vr, "fig_variance_ratio", 18, 7)
+
+band <- 1.96 * sqrt(0.95 * 0.05 / cfg$M)
+save_latex(covt %>% transmute(Distribution = dist, Generator = gen_lab, p, Regime = regime, Method = method_lab,
+                              Coverage = coverage, `Mean length` = mean_length, `MC SD` = sd_mc, `Mean s.e.` = mean_se) %>%
+             arrange(p, Distribution, Generator), "coverage",
+           caption = sprintf("Empirical coverage of 95%% Wald intervals at n = %d (Monte Carlo band 0.95 +/- %.3f).", cfg$n, band))
+d <- covt %>% filter(is.finite(coverage))
+pl <- ggplot(d, aes(factor(p), coverage, colour = method_lab, shape = regime)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0.95 - band, ymax = 0.95 + band, alpha = 0.15) +
+  geom_hline(yintercept = 0.95, linetype = 2) + geom_point(size = 3, position = position_dodge(0.6)) +
+  facet_grid(gen_lab ~ dist) + scale_colour_manual(values = meth_col) +
+  labs(x = "p", y = "Empirical coverage", colour = NULL, shape = NULL,
+       title = "Coverage of 95% Wald confidence intervals (plug-in standard errors)") + theme_article(13)
+emit_plot(pl, d, "fig_coverage", 16, 9)
+```
+
+## Objective 2c: bias and bandwidth sweep $h_n=n^{-a}$ of the recursive kernel estimator
+
+The recursive indicator estimator does not depend on $a$ and is the **reference** (dashed line).
+Signed-bias figure: points = Monte Carlo ($\pm2$ MC standard errors), line = first-order prediction ($a<1/2$).
+
+```{r obj2-asweep, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main), fig.width = 16, fig.height = 12}
+ref <- summ %>% filter(n == cfg$n, method == "rec_ind") %>%
+  transmute(dist, gen, p, bias_ind = bias, absbias_ind = abs(bias), var_ind = sd^2, mse_ind = rmse^2, mcse_ind = mcse_bias)
+ker <- summ %>% filter(n == cfg$n, method == "rec_ker") %>% left_join(ref, by = c("dist", "gen", "p")) %>%
+  mutate(var = sd^2, mse = rmse^2, better_bias = abs(bias) < absbias_ind,
+         signif_bias = abs(bias) + 2 * mcse_bias < absbias_ind - 2 * mcse_ind,
+         better_var = var < var_ind, better_mse = mse < mse_ind)
+sel <- ker %>% group_by(dist, gen_lab, p) %>%
+  summarise(`a: smaller |bias|` = paste(a[better_bias %in% TRUE], collapse = ", "),
+            `a: significantly smaller |bias|` = paste(a[signif_bias %in% TRUE], collapse = ", "),
+            `a: smaller variance` = paste(a[better_var %in% TRUE], collapse = ", "),
+            `a: both` = paste(a[(better_bias & better_var) %in% TRUE], collapse = ", "),
+            `best a (bias)` = a[which.min(abs(bias))], `best a (variance)` = a[which.min(var)],
+            `best a (MSE)` = a[which.min(mse)], .groups = "drop") %>% rename(Distribution = dist, Generator = gen_lab)
+write.csv(ker, file.path(cfg$out, "rec_kernel_a_sweep.csv"), row.names = FALSE)
+save_latex(sel, "a_sweep_selection",
+           caption = "Values of the bandwidth exponent a for which the recursive kernel estimator outperforms the recursive indicator estimator (final n).")
+
+for (gname in names(gens)) for (mt in list(c("bias", "|Bias|"), c("var", "Variance"), c("mse", "MSE"))) {
+  dk <- ker %>% filter(gen == gname)
+  dk$y <- switch(mt[1], bias = abs(dk$bias), var = dk$var, mse = dk$mse)
+  dk$yref <- switch(mt[1], bias = dk$absbias_ind, var = dk$var_ind, mse = dk$mse_ind)
+  dk <- dk %>% filter(is.finite(y), y > 0)
+  pl <- ggplot(dk, aes(a, y)) +
+    annotate("rect", xmin = -Inf, xmax = 0.25, ymin = 0, ymax = Inf, alpha = 0.07, fill = "red") +
+    geom_line(colour = "#0072B2", linewidth = 1) + geom_point(colour = "#0072B2", size = 2.5) +
+    geom_hline(aes(yintercept = yref), colour = "black", linetype = 2) +
+    facet_grid(dist ~ p, scales = "free_y", labeller = labeller(p = label_both)) +
+    scale_x_continuous(breaks = cfg$a_rec) + scale_y_log10() +
+    labs(x = expression(a ~ "(" * h[n] == n^{-a} * ")"), y = mt[2],
+         title = sprintf("%s of the recursive kernel estimator versus a (%s)", mt[2], gen_lab[[gname]]),
+         subtitle = "Dashed: recursive indicator (reference). Shaded: a < 1/4 (oversmoothing)") +
+    theme_article(12) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  emit_plot(pl, dk, sprintf("fig_rec_a_sweep_%s_%s", mt[1], gname), 16, 12)
+}
+d <- ker %>% filter(is.finite(bias))
+pl <- ggplot(d, aes(a, bias)) + geom_hline(yintercept = 0, colour = "grey50") +
+  geom_errorbar(aes(ymin = bias - 2 * mcse_bias, ymax = bias + 2 * mcse_bias), width = 0, colour = "#0072B2") +
+  geom_point(colour = "#0072B2", size = 2) +
+  geom_line(data = d %>% filter(is.finite(bias_theory)), aes(y = bias_theory), colour = "red", linewidth = 0.9) +
+  facet_grid(dist + gen_lab ~ p, scales = "free_y") +
+  labs(x = "a", y = "Bias (superquantile scale)",
+       title = "Recursive kernel estimator: Monte Carlo bias versus first-order prediction",
+       subtitle = "Blue: Monte Carlo +/- 2 MC s.e.; red: first-order prediction (a < 1/2)") + theme_article(11)
+emit_plot(pl, d, "fig_rec_bias_theory", 16, 18)
+```
+
+# Asymptotic normality: Kolmogorov distances up to $n=100\,000$
+
+To evaluate the accuracy of the asymptotic Gaussian approximation, we compute the Kolmogorov distance between the
+empirical distribution of $\sqrt{n}\bigl(\widehat\theta_n-\theta\bigr)$ and its Gaussian limit. A decreasing Kolmogorov
+distance provides empirical evidence for the validity of the central limit theorem and quantifies the speed at which
+the limiting approximation becomes accurate. All estimators are standardised by the same efficient asymptotic standard deviation,
+$Z_n=\sqrt n(\widehat{SQ}-SQ)/\sigma$, since the empirical and undersmoothed kernel estimators and the recursive
+estimators with Newton gains or Polyak–Ruppert averaging share the variance $\sigma^2$. Only regular scenarios ($\mathrm{Var}(\gamma'(X))<\infty$) are used. One recursive pass of length
+$\max n$ gives the recursive estimators at all sample sizes; batch estimators are recomputed on each prefix.
+
+```{r ks-engine}
+ks_scenarios <- function() list(
+  list(dist = "N(0,1)", gen = "quad"), list(dist = "GPD(0.3)", gen = "quad"),
+  list(dist = "N(0,1)", gen = "asinh"), list(dist = "GPD(0.3)", gen = "asinh"),
+  list(dist = "GPD(0.8)", gen = "asinh"), list(dist = "Stable(1.5,0)", gen = "asinh"))
+
+run_ks_block <- function(sc, si, b, cfg, B) {
+  set.seed(cfg$seed + 3000017L + 1009L * si + b)
+  d <- dists[[sc$dist]]; gen <- gens[[sc$gen]]; nmax <- max(cfg$n_ks)
+  X <- matrix(d$r(B * nmax), B, nmax); GX <- gen$g1(X); out <- list()
+  for (p in cfg$p_levels) {
+    for (m in cfg$n_ks) {
+      Xm <- X[, seq_len(m), drop = FALSE]; Xs <- sort_rows(Xm)
+      h <- (if (cfg$h_scale == "robust") apply(Xm, 1, robust_scale) else rep(1, B)) * m^(-cfg$a_default)
+      kq <- ceiling(m * p - 1e-9)
+      out[[paste("emp", p, m, sep = "|")]] <- est_emp_rows(Xs, p, gen)$est
+      out[[paste("ker", p, m, sep = "|")]] <- vapply(seq_len(B), function(i)
+        est_kernel(Xm[i, ], p, gen, h[i], qh = kernel_quantile(Xm[i, ], p, h[i], start = Xs[i, kq]))$est, numeric(1))
+    }
+    n0 <- min(n0_rule(p), floor(min(cfg$n_ks) / 2))
+    ws <- warm_start_rows(X, p, gen, n0)
+    rr <- rec_engine(X, GX, p, gen, ws, cfg$a_pr, cfg$a_pr, cfg$n_ks, cfg$h_scale)
+    for (j in seq_along(rr$n)) {
+      out[[paste("rec_ind", p, rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, "rec_ind|NA"])
+      out[[paste("rec_ker", p, rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, paste0("rec_ker|", cfg$a_default)])
+      out[[paste("rec_pr", p, rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, paste0("rec_pr|", cfg$a_default)])
+      out[[paste("rec_ker04", p, rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, paste0("rec_ker|", cfg$a_rec_ref)])
+      out[[paste("rec_pr04", p, rr$n[j], sep = "|")]] <- gen$ginv(rr$T[[j]][, paste0("rec_pr|", cfg$a_rec_ref)])
+    }
+  }
+  out
+}
+run_ks <- function(cfg) {
+  B <- min(100L, cfg$M_ks); nb <- ceiling(cfg$M_ks / B); scs <- ks_scenarios(); res <- list()
+  for (si in seq_along(scs)) {
+    sc <- scs[[si]]
+    f <- file.path(cfg$out, sprintf("ks3_%s_%s_nmax%d_M%d.rds", file_id(sc$dist), sc$gen, max(cfg$n_ks), nb * B))
+    if (file.exists(f)) { res[[si]] <- readRDS(f); next }
+    rl <- par_map(seq_len(nb), function(b) run_ks_block(sc, si, b, cfg, B), cfg$cores)
+    res[[si]] <- list(dist = sc$dist, gen = sc$gen, est = do.call(Map, c(list(f = c), rl)))
+    saveRDS(res[[si]], f)
+    message("Kolmogorov experiment: ", sc$dist, " / ", sc$gen, " done")
+  }
+  res
+}
+```
+
+```{r ks-run, eval = isTRUE(get0("params", ifnotfound = list(run_ks = TRUE))$run_ks), fig.width = 16, fig.height = 10}
+KS <- run_ks(cfg)
+ks_tab <- do.call(rbind, lapply(KS, function(r) do.call(rbind, lapply(names(r$est), function(k) {
+  sp <- strsplit(k, "|", fixed = TRUE)[[1]]; m <- sp[1]; p <- as.numeric(sp[2]); n <- as.integer(sp[3])
+  tr <- TR[[paste(r$dist, r$gen, p, sep = "|")]]
+  th <- theory_for(tr, key_method(m), key_a(m), n, pop_scale(dists[[r$dist]], cfg))
+  v <- r$est[[k]]; v <- v[is.finite(v)]
+  data.frame(dist = r$dist, gen = r$gen, p = p, method = m, n = n, M = length(v),
+             ks = if (is.finite(th[["sd"]]) && th[["sd"]] > 0) ks_stat((v - tr$s) / th[["sd"]]) else NA_real_)
+}))))
+ks_tab$method_lab <- factor(meth_lab[ks_tab$method], levels = meth_lab)
+ks_tab$gen_lab <- factor(gen_lab[ks_tab$gen], levels = gen_lab)
+write.csv(ks_tab, file.path(cfg$out, "ks_distances.csv"), row.names = FALSE)
+
+ks_avg <- ks_tab %>% filter(is.finite(ks)) %>% group_by(method_lab, n) %>%
+  summarise(`KS distance` = mean(ks), .groups = "drop") %>% arrange(n, method_lab) %>% rename(Method = method_lab)
+save_latex(ks_avg, "ks_average", label = "ks-average",
+  caption = "Average Kolmogorov distances between the empirical distribution of the standardized statistic Z_n = sqrt(n)(SQ_hat - SQ)/sigma and the standard normal distribution (averaged over distributions, generators and levels p). Smaller values indicate a better Gaussian approximation.")
+save_latex(ks_tab %>% transmute(Distribution = dist, Generator = gen_lab, p, Method = method_lab, n, KS = ks) %>%
+             pivot_wider(names_from = n, values_from = KS, names_prefix = "n = "), "ks_detailed", digits = 3,
+           caption = "Kolmogorov distances to N(0,1) by scenario, method and sample size.")
+d <- ks_tab %>% filter(is.finite(ks))
+pl <- ggplot(d, aes(n, ks, colour = method_lab)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.1) + stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_x_log10(breaks = cfg$n_ks, labels = format(cfg$n_ks, big.mark = ",", scientific = FALSE)) +
+  facet_wrap(~ dist + gen_lab, nrow = 2) + scale_colour_manual(values = meth_col) +
+  labs(x = "Sample size n (log scale)", y = "Kolmogorov distance (average over p)", colour = NULL,
+       title = "Kolmogorov distance between the standardized estimator and N(0,1)",
+       subtitle = "All estimators standardized by the efficient asymptotic standard deviation sigma") + theme_article(13)
+emit_plot(pl, d, "fig_ks_distance", 16, 10)
+
+## quantities used in the paragraph below
+kw <- ks_avg %>% pivot_wider(names_from = Method, values_from = `KS distance`)
+n_last <- max(ks_avg$n)
+diff_ek <- max(abs(kw[["Empirical (batch)"]] - kw[["Kernel (batch)"]]), na.rm = TRUE)
+best_last <- as.character(ks_avg$Method[ks_avg$n == n_last][which.min(ks_avg$`KS distance`[ks_avg$n == n_last])])
+rec_rank <- ks_avg %>% group_by(n) %>%
+  summarise(rec_best = as.character(Method[which.min(`KS distance`)]) %in%
+              meth_lab[c("rec_ind", "rec_ker", "rec_ker04", "rec_pr", "rec_pr04")], .groups = "drop")
+decr <- ks_avg %>% group_by(Method) %>%
+  summarise(dec = `KS distance`[n == max(n)] < `KS distance`[n == min(n)], .groups = "drop")
+ks_text <- sprintf(paste(
+  "Table \\ref{tab:ks-average} summarizes the Kolmogorov distances between the empirical distribution of the standardized",
+  "statistic $Z_n$ and the standard normal distribution, for $n$ from %s to %s. Since smaller KS values indicate a closer",
+  "agreement with the Gaussian limit, they provide a quantitative assessment of the finite-sample validity of the central",
+  "limit theorem. The average KS distance decreases with $n$ for %d of the %d estimators. The empirical and kernel",
+  "estimators exhibit %s behaviour (largest difference between their average KS distances: %.3f), which suggests that",
+  "kernel smoothing with $a=%.2f$ has only a limited impact on the Gaussian approximation in the considered settings.",
+  "A recursive estimator achieves the smallest average KS distance at %d of the %d sample sizes; at $n=%s$ the smallest",
+  "distance is obtained by the %s estimator."),
+  format(min(cfg$n_ks), big.mark = ","), format(n_last, big.mark = ","), sum(decr$dec, na.rm = TRUE), nrow(decr),
+  if (diff_ek < 0.02) "nearly identical" else "noticeably different", diff_ek, cfg$a_default,
+  sum(rec_rank$rec_best), nrow(rec_rank), format(n_last, big.mark = ","), tolower(best_last))
+writeLines(ks_text, file.path(cfg$out, "tables", "ks_paragraph.tex"))
+```
+
+**Reading of the Kolmogorov distances** (text generated from the results and also written to `out/tables/ks_paragraph.tex`):
+`r if (exists("ks_text")) ks_text else "run the chunk ks-run first."`
+
+## Objective 2d: bandwidth regimes of the batch kernel estimator
+
+$h_n=c\,n^{-a}$; bias $\approx B'h_n^2$, standard deviation $\approx\sigma/\sqrt n$, hence
+$\text{bias}/\text{sd}\approx B'\sqrt n\,h_n^2/\sigma$ with $\sqrt n h_n^2=c^2n^{1/2-2a}$:
+$a>1/4$ undersmoothing, $a=1/4$ critical (limit $\mathcal N(c^2B',\sigma^2)$), $a<1/4$ oversmoothing.
+The black line is the prediction $B'x/\sigma$, a direct test of the corrected constant $B'$.
+
+```{r bw-engine}
+run_bw_block <- function(d, di, b, cfg, gens, a_bw, B) {
+  set.seed(cfg$seed + 7000003L + 100003L * di + b)
+  n <- cfg$n; X <- matrix(d$r(B * n), B, n); out <- list()
+  cs <- if (cfg$h_scale == "robust") apply(X, 1, robust_scale) else rep(1, B)
+  for (a in a_bw) for (p in cfg$p_levels) {
+    h <- cs * n^(-a)
+    qh <- vapply(seq_len(B), function(i) kernel_quantile(X[i, ], p, h[i]), numeric(1))
+    for (g in names(gens)) out[[paste(g, p, a, sep = "|")]] <-
+      gens[[g]]$ginv(vapply(seq_len(B), function(i) est_kernel(X[i, ], p, gens[[g]], h[i], qh = qh[i])$T, numeric(1)))
+  }
+  out
+}
+run_bw <- function(cfg, dists, gens, a_bw = c(0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5)) {
+  B <- min(cfg$block, cfg$M_bw); nb <- ceiling(cfg$M_bw / B); res <- list()
+  for (di in seq_along(dists)) {
+    d <- dists[[di]]
+    f <- file.path(cfg$out, sprintf("bw_%s_n%d_M%d.rds", file_id(d$id), cfg$n, nb * B))
+    if (file.exists(f)) { res[[d$id]] <- readRDS(f); next }
+    rl <- par_map(seq_len(nb), function(b) run_bw_block(d, di, b, cfg, gens, a_bw, B), cfg$cores)
+    res[[d$id]] <- do.call(Map, c(list(f = c), rl)); saveRDS(res[[d$id]], f)
+    message("Bandwidth regimes: ", d$id, " done")
+  }
+  res
+}
+```
+
+```{r bw-run, eval = isTRUE(get0("params", ifnotfound = list(run_bw = TRUE))$run_bw), fig.width = 16, fig.height = 12}
+BW <- run_bw(cfg, dists, gens)
+bw <- do.call(rbind, lapply(names(BW), function(dn) do.call(rbind, lapply(names(BW[[dn]]), function(k) {
+  sp <- strsplit(k, "|", fixed = TRUE)[[1]]; g <- sp[1]; p <- as.numeric(sp[2]); a <- as.numeric(sp[3])
+  v <- BW[[dn]][[k]]; v <- v[is.finite(v)]; tr <- TR[[paste(dn, g, p, sep = "|")]]
+  cpop <- pop_scale(dists[[dn]], cfg); x <- sqrt(cfg$n) * (cpop * cfg$n^(-a))^2
+  data.frame(dist = dn, gen = g, p = p, a = a, regime = tr$regime, M = length(v), x = x,
+             bias = mean(v) - tr$s, sd = sd(v), ratio = (mean(v) - tr$s) / sd(v),
+             bias_theory = tr$Bprime * (cpop * cfg$n^(-a))^2,
+             ratio_theory = if (is.finite(tr$sigma2)) tr$Bprime * x / sqrt(tr$sigma2) else NA_real_,
+             regime_h = ifelse(abs(a - 0.25) < 1e-9, "critical (a = 1/4)", ifelse(a > 0.25, "undersmoothing", "oversmoothing")))
+}))))
+write.csv(bw, file.path(cfg$out, "bandwidth_regimes.csv"), row.names = FALSE)
+save_latex(bw %>% transmute(Distribution = dist, Generator = gen_lab[gen], p, a, Regime = regime_h, `sqrt(n) h^2` = x,
+                            Bias = bias, `B' h^2` = bias_theory, `Bias/SD` = ratio, `Predicted bias/SD` = ratio_theory),
+           "bandwidth_regimes", digits = 4,
+           caption = "Batch kernel estimator: Monte Carlo bias, theoretical bias B' h_n^2, bias-to-SD ratio and its prediction B' sqrt(n) h_n^2 / sigma.")
+for (gname in names(gens)) {
+  d <- bw %>% filter(gen == gname, is.finite(ratio))
+  pl <- ggplot(d, aes(x, ratio, colour = regime_h)) + geom_hline(yintercept = 0, colour = "grey60") +
+    geom_errorbar(aes(ymin = ratio - 1.96 / sqrt(M), ymax = ratio + 1.96 / sqrt(M)), width = 0) +
+    geom_point(size = 2.5) + geom_line(aes(y = ratio_theory), colour = "black", linetype = 2, na.rm = TRUE) +
+    scale_x_log10() + facet_grid(dist ~ p, scales = "free_y", labeller = labeller(p = label_both)) +
+    labs(x = expression(sqrt(n) * h[n]^2 ~ "(log scale)"), y = "Bias / standard deviation", colour = NULL,
+         title = sprintf("Bandwidth regimes of the batch kernel estimator (%s, n = %d)", gen_lab[[gname]], cfg$n),
+         subtitle = "Dashed: B' sqrt(n) h_n^2 / sigma. GPD at p = 0.25: boundary effect at 0 when h is large.") +
+    theme_article(12)
+  emit_plot(pl, d, paste0("fig_bandwidth_regimes_", gname), 16, 12)
+}
+```
+
+## Objective 3: trajectories and streaming cost
+
+```{r traj, eval = isTRUE(get0("params", ifnotfound = list(run_traj = TRUE))$run_traj), fig.width = 16, fig.height = 16}
+trajectories <- function(cfg, n_pts = 100) {
+  step <- cfg$n / n_pts; grid <- as.integer(seq(step, cfg$n, by = step)); out <- list()
+  for (di in seq_along(dists)) {
+    d <- dists[[di]]; set.seed(cfg$seed + 31L * di); x <- d$r(cfg$n); X <- matrix(x, 1)
+    for (p in cfg$p_levels) {
+      hm <- vapply(grid, function(m) (if (cfg$h_scale == "robust") robust_scale(x[1:m]) else 1) * m^(-cfg$a_default), numeric(1))
+      qh <- vapply(seq_along(grid), function(j) kernel_quantile(x[1:grid[j]], p, hm[j]), numeric(1))
+      for (g in names(gens)) {
+        gen <- gens[[g]]; tv <- TR[[paste(d$id, g, p, sep = "|")]]$s
+        ws <- warm_start_rows(X, p, gen, n0_rule(p))
+        rr <- rec_engine(X, gen$g1(X), p, gen, ws, cfg$a_pr, cfg$a_pr, grid, cfg$h_scale)
+        rec <- do.call(rbind, lapply(seq_along(rr$n), function(j) data.frame(
+          n = rr$n[j], method = c("rec_ker", "rec_ker04", "rec_pr", "rec_pr04", "rec_ind"), est = gen$ginv(as.numeric(rr$T[[j]][1, ])))))
+        bat <- data.frame(n = rep(grid, 2), method = rep(c("emp", "ker"), each = length(grid)),
+                          est = c(vapply(grid, function(m) est_emp_rows(sort_rows(X[, 1:m, drop = FALSE]), p, gen)$est, numeric(1)),
+                                  vapply(seq_along(grid), function(j) est_kernel(x[1:grid[j]], p, gen, hm[j], qh = qh[j])$est, numeric(1))))
+        z <- rbind(rec, bat); z$dist <- d$id; z$gen <- gen$label; z$p <- p; z$truth <- tv
+        out[[length(out) + 1]] <- z
+      }
+    }
+  }
+  z <- do.call(rbind, out)
+  z$method <- factor(meth_lab[z$method], levels = meth_lab); z$dist <- factor(z$dist, levels = names(dists))
+  z$gen <- factor(z$gen, levels = gen_lab)
+  z %>% group_by(p, dist, gen) %>%
+    mutate(lo = min(truth[1], quantile(est, 0.02, na.rm = TRUE)), hi = max(truth[1], quantile(est, 0.98, na.rm = TRUE)),
+           est_c = pmin(pmax(est, lo - 0.15 * (hi - lo)), hi + 0.15 * (hi - lo))) %>% ungroup()
+}
+TRJ <- trajectories(cfg)
+for (pp in cfg$p_levels) {
+  d <- TRJ %>% filter(p == pp, is.finite(est_c))
+  pl <- ggplot(d, aes(n, est_c, colour = method, linetype = method)) + geom_line(linewidth = 0.8) +
+    geom_hline(data = distinct(d, dist, gen, truth), aes(yintercept = truth), linetype = 2, colour = "grey30") +
+    facet_grid(dist ~ gen, scales = "free_y") + scale_colour_manual(values = meth_col) +
+    scale_linetype_manual(values = setNames(c("solid", "22", "solid", "solid", "solid", "42", "42"), meth_lab)) +
+    labs(x = "Sample size n", y = "Superquantile estimate", colour = NULL, linetype = NULL,
+         title = sprintf("Representative trajectories (p = %.2f)", pp),
+         subtitle = "Dashed grey: true value. Curves clipped per panel for readability.") +
+    theme_article(14) + guides(colour = guide_legend(nrow = 2))
+  emit_plot(pl, d, paste0("fig_trajectories_p_", pfile(pp)), 16, 16)
+}
+```
+
+```{r stream, eval = isTRUE(get0("params", ifnotfound = list(run_stream = TRUE))$run_stream), fig.width = 14, fig.height = 7}
+stream_cost <- function(d, gen, p, N, every, cfg) {
+  set.seed(cfg$seed + 999L); x <- d$r(N); r <- 1 - p; n0 <- n0_rule(p)
+  ws <- warm_start_rows(matrix(x, 1), p, gen, n0); Q <- ws$Q; T <- ws$T; gq <- ws$gq
+  cps <- seq(every, N, by = every); cps <- cps[cps > n0]
+  t_rec <- t_emp <- t_ker <- numeric(length(cps)); tcum <- 0; i <- n0
+  timeit <- function(f, reps = 3) { t0 <- proc.time()[["elapsed"]]; for (k in 1:reps) f(); (proc.time()[["elapsed"]] - t0) / reps }
+  for (j in seq_along(cps)) {
+    t0 <- proc.time()[["elapsed"]]
+    while (i < cps[j]) {
+      i <- i + 1L; xi <- x[i]
+      W <- pnorm((Q - xi) / (i^(-cfg$a_default)))
+      T <- T - (T - gen$g1(xi) * (1 - W) / r - gen$g1(Q) * (W - p) / r) / i   # Newton gains
+      Q <- Q - gq * (W - p) / i
+    }
+    tcum <- tcum + proc.time()[["elapsed"]] - t0; t_rec[j] <- tcum
+    m <- cps[j]; xm <- x[1:m]
+    t_emp[j] <- timeit(function() est_emp_rows(sort_rows(matrix(xm, 1)), p, gen))
+    t_ker[j] <- timeit(function() est_kernel(xm, p, gen, m^(-cfg$a_default)))
+  }
+  data.frame(n = cps, Recursive = t_rec, Empirical = cumsum(t_emp), Kernel = cumsum(t_ker),
+             `Memory, recursive (bytes)` = as.numeric(object.size(c(Q, T, gq, i))), `Memory, batch (bytes)` = 8 * cps,
+             check.names = FALSE)
+}
+every <- max(50L, cfg$n %/% 100L)
+SC <- stream_cost(dists[["GPD(0.3)"]], gens$asinh, 0.95, cfg$n, every, cfg)
+write.csv(SC, file.path(cfg$out, "streaming_cost.csv"), row.names = FALSE)
+scl <- SC %>% select(n, Recursive, Empirical, Kernel) %>% pivot_longer(-n, names_to = "Method", values_to = "time") %>% filter(time > 0)
+pl <- ggplot(scl, aes(n, time, colour = Method)) + geom_line(linewidth = 1.1) + scale_x_log10() + scale_y_log10() +
+  labs(x = "Number of observations processed (log scale)", y = "Cumulative CPU time (s, log scale)", colour = NULL,
+       title = "Cost of keeping the estimate up to date in a data stream (GPD(0.3), asinh, p = 0.95)",
+       subtitle = sprintf("Batch estimators recomputed every %d observations; recursive estimator updated at each observation", every)) +
+  theme_article(14)
+emit_plot(pl, scl, "fig_streaming_cost", 14, 7)
+save_latex(tail(SC, 1), "streaming_cost", digits = 4, caption = "Cumulative CPU time (s) and memory (bytes) at the last checkpoint.")
+```
+
+# Objective 4: Bregman superquantiles for parameter estimation
+
+## Generalized Pareto distribution under contamination
+
+$X\sim(1-\varepsilon)F+\varepsilon G$, $F=$ GPD$(\xi,1)$, $G=Q_F(0.999)\times$Pareto$(1.05)$ (extreme outliers),
+$\varepsilon\in\{0,0.05\}$, $\xi\in\{0.1,0.5\}$. Estimators: maximum likelihood (MLE), Hill ($\xi$ only),
+score-quantile (Section 5.1, **identified only for $p<p^*(\xi)\approx0.80$–$0.86$**), and quantile/superquantile matching
+with the quadratic generator ("CVaR matching") and with `asinh` ("Bregman matching"), the superquantile being estimated
+by the empirical, kernel or recursive estimator.
+
+```{r gpd-defs}
+.na2 <- c(xi = NA_real_, sigma = NA_real_)
+est_gpd_mle <- function(x) {
+  nll <- function(par) { xi <- par[1]; sg <- exp(par[2]); if (abs(xi) < 1e-6) xi <- 1e-6
+    z <- 1 + xi * x / sg; if (any(z <= 0)) return(1e10); length(x) * log(sg) + (1 / xi + 1) * sum(log(z)) }
+  best <- NULL
+  for (s0 in list(c(0.2, log(mean(x) * 0.8)), c(0.5, log(median(x))), c(0.05, log(mean(x))))) {
+    fit <- tryCatch(optim(s0, nll, control = list(maxit = 3000, reltol = 1e-11)), error = function(e) NULL)
+    if (!is.null(fit) && fit$value < 1e9 && (is.null(best) || fit$value < best$value)) best <- fit
+  }
+  if (is.null(best)) .na2 else c(xi = best$par[1], sigma = exp(best$par[2]))
+}
+est_gpd_hill <- function(x, k = floor(sqrt(length(x)))) {
+  xs <- sort(x[x > 0], decreasing = TRUE); c(xi = mean(log(xs[1:k])) - log(xs[k + 1]), sigma = NA_real_)
+}
+h_fun <- function(y, xi) -log(y) / xi - (1 + xi) / xi^2 * (1 - y^xi)
+p_star <- function(xi) { us <- (1 + xi)^(-1 / xi); 1 - uniroot(function(u) h_fun(u, xi), c(1e-300, us), tol = 1e-14)$root }
+#' Largest xi such that p < p*(xi) (p* is decreasing in xi): upper end of the root search of the score-quantile equation.
+xi_max_for <- function(p) if (p_star(0.99) > p) 0.99 else uniroot(function(xi) p_star(xi) - p, c(0.02, 0.99), tol = 1e-10)$root
+est_gpd_scorequant <- function(x, p) {
+  r <- 1 - p; qh <- as.numeric(quantile(x, p, type = 1))
+  if (p >= p_star(0.02)) return(.na2)                 # not identified for any xi in the search range
+  zp <- function(xi) {
+    y1 <- tryCatch(uniroot(function(y) h_fun(y, xi) - h_fun(y + p, xi), c(1e-12, r - 1e-12), tol = 1e-13)$root,
+                   error = function(e) NA_real_)
+    h_fun(y1, xi)
+  }
+  eq <- function(xi) { sg <- xi * qh / (r^(-xi) - 1)
+    t2 <- log1p(xi * x / sg) / xi^2 - (1 + xi) * x / (sg * xi + xi^2 * x)
+    as.numeric(quantile(t2, p, type = 1)) - zp(xi) }
+  xi <- tryCatch(uniroot(eq, c(0.02, xi_max_for(p) - 1e-6), tol = 1e-8)$root, error = function(e) NA_real_)
+  if (!is.finite(xi) || p >= p_star(xi)) return(.na2)
+  c(xi = xi, sigma = xi * qh / (r^(-xi) - 1))
+}
+gpd_model_sq <- function(xi, sg, p, gen) {
+  r <- 1 - p; q <- sg / xi * (r^(-xi) - 1); sq <- sg + xi * q
+  if (gen$name == "quad") return(c(q = q, s = (sg + q) / (1 - xi)))
+  y <- q + sq / xi * (exp(xi * .GLag$x) - 1)
+  c(q = q, s = gen$ginv(sum(.GLag$w * gen$g1(y))))
+}
+est_gpd_match <- function(qh, sh, p, gen) {
+  r <- 1 - p
+  if (!is.finite(qh) || !is.finite(sh) || qh <= 0) return(.na2)
+  sig_of <- function(xi) xi * qh / (r^(-xi) - 1)
+  f <- function(xi) gpd_model_sq(xi, sig_of(xi), p, gen)[["s"]] - sh
+  hi <- if (gen$name == "quad") 0.98 else 1.5
+  xi <- tryCatch(uniroot(f, c(0.01, hi), tol = 1e-9)$root, error = function(e) NA_real_)
+  if (!is.finite(xi)) .na2 else c(xi = xi, sigma = sig_of(xi))
+}
+run_gpd_block <- function(xi0, eps, b, cfg, B) {
+  set.seed(cfg$seed + 5000011L + round(1e4 * xi0) * 101L + round(100 * eps) * 7L + b)
+  F <- make_dist("gpd", xi = xi0); n <- cfg$n_param
+  X <- matrix(F$r(B * n), B, n)
+  if (eps > 0) { m <- runif(B * n) < eps; X[m] <- F$q(0.999) * runif(sum(m))^(-1 / 1.05) }
+  rows <- list()
+  add <- function(method, sqe, p, th, i) rows[[length(rows) + 1]] <<- data.frame(
+    xi0 = xi0, eps = eps, rep = (b - 1) * B + i, method = method, sq_est = sqe, p = p,
+    xi_hat = unname(th[1]), sigma_hat = unname(th[2]))
+  for (i in seq_len(B)) { add("MLE", NA, NA, est_gpd_mle(X[i, ]), i); add("Hill", NA, NA, est_gpd_hill(X[i, ]), i) }
+  Xs <- sort_rows(X)
+  for (p in cfg$p_levels) {
+    for (i in seq_len(B)) add("Score-quantile", NA, p, est_gpd_scorequant(X[i, ], p), i)
+    h <- n^(-cfg$a_default)
+    qh <- vapply(seq_len(B), function(i) kernel_quantile(X[i, ], p, h), numeric(1))
+    for (g in names(gens)) {
+      gen <- gens[[g]]; lab <- if (g == "quad") "CVaR matching" else "Bregman (asinh) matching"
+      e <- est_emp_rows(Xs, p, gen)
+      k <- lapply(seq_len(B), function(i) est_kernel(X[i, ], p, gen, h, qh = qh[i]))
+      ws <- warm_start_rows(X, p, gen, n0_rule(p))
+      rr <- rec_engine(X, gen$g1(X), p, gen, ws, cfg$a_default, numeric(0), n, cfg$h_scale, ind = FALSE)
+      cc <- paste0("rec_ker|", cfg$a_default)
+      for (i in seq_len(B)) {
+        add(lab, "empirical", p, est_gpd_match(e$q[i], e$est[i], p, gen), i)
+        add(lab, "kernel", p, est_gpd_match(k[[i]]$q, k[[i]]$est, p, gen), i)
+        add(lab, "recursive", p, est_gpd_match(rr$Q[[1]][i, cc], gen$ginv(rr$T[[1]][i, cc]), p, gen), i)
+      }
+    }
+  }
+  do.call(rbind, rows)
+}
+run_gpd <- function(cfg, xis = c(0.1, 0.5), epss = c(0, 0.05)) {
+  B <- min(100L, cfg$M_param); nb <- ceiling(cfg$M_param / B)
+  f <- file.path(cfg$out, sprintf("gpd_params_n%d_M%d.rds", cfg$n_param, nb * B))
+  if (file.exists(f)) return(readRDS(f))
+  jobs <- expand.grid(xi0 = xis, eps = epss, b = seq_len(nb))
+  rl <- par_map(seq_len(nrow(jobs)), function(j) run_gpd_block(jobs$xi0[j], jobs$eps[j], jobs$b[j], cfg, B), cfg$cores)
+  res <- do.call(rbind, rl); saveRDS(res, f); res
+}
+```
+
+```{r gpd-run, eval = isTRUE(get0("params", ifnotfound = list(run_gpd = TRUE))$run_gpd), fig.width = 16, fig.height = 11}
+GP <- run_gpd(cfg)
+kable(data.frame(xi = c(0.1, 0.3, 0.5, 0.8), `p*(xi)` = vapply(c(0.1, 0.3, 0.5, 0.8), p_star, 1), check.names = FALSE),
+      digits = 3, caption = "Identifiability threshold p*(xi) of the score-quantile estimator")
+gsum <- GP %>% mutate(sq_est = ifelse(is.na(sq_est), "-", sq_est)) %>%
+  group_by(xi0, eps, method, sq_est, p) %>%
+  summarise(M = n(), `Failure rate` = mean(!is.finite(xi_hat)),
+            `Bias xi` = mean(xi_hat - xi0, na.rm = TRUE), `RMSE xi` = sqrt(mean((xi_hat - xi0)^2, na.rm = TRUE)),
+            `Bias sigma` = mean(sigma_hat - 1, na.rm = TRUE), `RMSE sigma` = sqrt(mean((sigma_hat - 1)^2, na.rm = TRUE)),
+            .groups = "drop") %>% arrange(xi0, eps, p, method, sq_est) %>%
+  rename(xi = xi0, epsilon = eps, Method = method, `Superquantile estimator` = sq_est)
+write.csv(gsum, file.path(cfg$out, "gpd_params_summary.csv"), row.names = FALSE)
+save_latex(gsum, "gpd_parameters", digits = 4,
+  caption = sprintf("Estimation of the GPD parameters (xi, sigma = 1) from clean and contaminated samples, n = %d, M = %d.", cfg$n_param, cfg$M_param))
+gp <- GP %>% filter(is.na(sq_est) | sq_est == "empirical", is.finite(xi_hat)) %>%
+  mutate(lab = ifelse(is.na(p), method, sprintf("%s (p = %.2f)", method, p)), err = xi_hat - xi0,
+         setting = sprintf("xi = %.1f, epsilon = %.2f", xi0, eps))
+if (nrow(gp)) gp$err_w <- winsor_by(gp$err, gp$setting, c(0.01, 0.99))
+pl <- ggplot(gp, aes(reorder(lab, abs(err), median), err_w, fill = method)) +
+  geom_hline(yintercept = 0, linetype = 2) + geom_boxplot(outlier.size = 0.4) + coord_flip() +
+  facet_wrap(~ setting, scales = "free_x") +
+  labs(x = NULL, y = expression(hat(xi) - xi), fill = NULL,
+       title = "GPD shape estimation from clean and contaminated samples",
+       subtitle = "Matching estimators use the empirical superquantile") + theme_article(12)
+emit_plot(pl, gp, "fig_gpd_xi_errors", 16, 11)
+d <- gsum %>% filter(Method %in% c("CVaR matching", "Bregman (asinh) matching"), is.finite(`RMSE xi`))
+pl <- ggplot(d, aes(factor(p), `RMSE xi`, colour = Method, shape = `Superquantile estimator`)) +
+  geom_point(size = 3, position = position_dodge(0.5)) + scale_y_log10() +
+  facet_wrap(~ sprintf("xi = %.1f, epsilon = %.2f", xi, epsilon), nrow = 1) +
+  labs(x = "p", y = "RMSE of xi-hat (log scale)", colour = NULL,
+       title = "Matching estimators: role of the generator and of the superquantile estimator") + theme_article(12)
+emit_plot(pl, d, "fig_gpd_matching_rmse", 16, 7)
+```
+
+### Contamination study at an identified level (Table "tab:contam" of the article)
+
+$n=200$, $p=0.8$ (identified for $\xi\in\{0.1,0.5\}$: $p^*(0.1)\approx0.856$, $p^*(0.5)\approx0.826$; and
+$\varepsilon=0.05<1-p$), contamination $(1-\varepsilon)F+\varepsilon\delta_{20\sigma}$, $M=1000$ replications. The matching
+estimators use the empirical quantile and superquantile. Failures (no root in the admissible range) are reported;
+bias and RMSE are computed over the other samples.
+
+```{r gpd-contam-table, eval = isTRUE(get0("params", ifnotfound = list(run_gpd = TRUE))$run_gpd)}
+run_contam <- function(xi0, eps, n = 200, p = 0.8, M = 1000) {
+  set.seed(cfg$seed + 77L + round(1e4 * xi0) + round(100 * eps))
+  rows <- vector("list", M)
+  for (m in seq_len(M)) {
+    x <- (runif(n)^(-xi0) - 1) / xi0
+    if (eps > 0) x[runif(n) < eps] <- 20
+    xs <- matrix(sort(x), 1); ea <- est_emp_rows(xs, p, gens$asinh); eq <- est_emp_rows(xs, p, gens$quad)
+    th <- rbind(`Bregman (asinh) matching` = est_gpd_match(ea$q, ea$est, p, gens$asinh),
+                `CVaR matching` = est_gpd_match(eq$q, eq$est, p, gens$quad),
+                Hill = est_gpd_hill(x), MLE = est_gpd_mle(x), `Score-quantile` = est_gpd_scorequant(x, p))
+    rows[[m]] <- data.frame(method = rownames(th), xi_hat = th[, 1], sigma_hat = th[, 2], row.names = NULL)
+  }
+  d <- do.call(rbind, rows)
+  d %>% group_by(method) %>%
+    summarise(Failure = mean(!is.finite(xi_hat)), `Bias xi` = mean(xi_hat - xi0, na.rm = TRUE),
+              `RMSE xi` = sqrt(mean((xi_hat - xi0)^2, na.rm = TRUE)),
+              `RMSE sigma` = if (all(is.na(sigma_hat))) NA_real_ else sqrt(mean((sigma_hat - 1)^2, na.rm = TRUE)),
+              .groups = "drop") %>% mutate(epsilon = eps, xi = xi0, .before = 1)
+}
+CONT <- do.call(rbind, lapply(c(0, 0.05), function(e) do.call(rbind, lapply(c(0.1, 0.5), function(x0) run_contam(x0, e)))))
+write.csv(CONT, file.path(cfg$out, "gpd_contamination_p08.csv"), row.names = FALSE)
+save_latex(CONT, "tab_contam", digits = 3,
+  caption = "Estimation of (xi, sigma) under contamination at 20 sigma, n = 200, p = 0.8, M = 1000.")
+```
+
+
+## Stable distributions: exact relation of Theorem 6.1
+
+A complete study (five superquantile estimators, five optimizers, ECF benchmark and ECF diagnostics) is given in the
+companion notebook `stable_parameters_superquantiles.Rmd`. Here $\theta=(\alpha,\beta,\gamma,\zeta)$ is estimated with
+the quadratic generator (exact relation $SQ_p-Q_p=H(Q_p;\theta)/(1-p)$) on both tails.
+
+```{r stable-defs}
+stable_obj <- function(par, st) {
+  al <- par[1]; be <- par[2]; ga <- par[3]; ze <- par[4]
+  if (al <= 1.02 || al > 2 || abs(be) > 0.99 || ga <= 0) return(1e10)
+  r1 <- (st$S_up - st$Q_up - H_stable(st$Q_up, al, be, ga, ze) / (1 - st$p)) / (1 + abs(st$S_up))
+  r2 <- (st$S_lo - st$Q_lo - H_stable(st$Q_lo, al, -be, ga, -ze) / (1 - st$p)) / (1 + abs(st$S_lo))
+  v <- sum(r1^2) + sum(r2^2); if (is.finite(v)) v else 1e10
+}
+fit_stable_H <- function(st) {
+  lo <- c(1.05, -0.95, 0.05, -5); hi <- c(2, 0.95, 10, 5)
+  S <- expand.grid(a = c(1.3, 1.6, 1.9), b = c(-0.4, 0, 0.4), g = c(0.5, 1), z = 0)
+  v0 <- apply(S, 1, stable_obj, st = st); best <- NULL
+  for (k in order(v0)[1:3]) {
+    o <- tryCatch(nlminb(as.numeric(S[k, ]), stable_obj, st = st, lower = lo, upper = hi, control = list(iter.max = 300)),
+                  error = function(e) NULL)
+    if (!is.null(o) && (is.null(best) || o$objective < best$objective)) best <- o
+  }
+  if (is.null(best)) rep(NA_real_, 4) else best$par
+}
+run_stable_block <- function(al0, be0, b, cfg, B) {
+  set.seed(cfg$seed + 9000001L + round(100 * al0) * 131L + round(100 * be0) * 17L + b)
+  n <- cfg$n_stable; P <- cfg$p_levels; gen <- gens$quad
+  X <- matrix(stabledist::rstable(B * n, alpha = al0, beta = be0, gamma = 1, delta = 0, pm = 0), B, n)
+  med <- apply(X, 1, median); sc <- apply(X, 1, robust_scale); Z <- (X - med) / sc
+  tails <- list(up = Z, lo = -Z); stats <- list()
+  for (tl in names(tails)) {
+    Y <- tails[[tl]]; Ys <- sort_rows(Y)
+    for (p in P) {
+      e <- est_emp_rows(Ys, p, gen); h <- n^(-cfg$a_default)
+      k <- lapply(seq_len(B), function(i) est_kernel(Y[i, ], p, gen, h))
+      ws <- warm_start_rows(Y, p, gen, n0_rule(p))
+      rr <- rec_engine(Y, Y, p, gen, ws, cfg$a_default, numeric(0), n, cfg$h_scale)
+      ck <- paste0("rec_ker|", cfg$a_default)
+      stats[[paste(tl, p)]] <- list(
+        empirical = cbind(e$q, e$est), kernel = cbind(vapply(k, `[[`, 1, "q"), vapply(k, `[[`, 1, "est")),
+        recursive_kernel = cbind(rr$Q[[1]][, ck], rr$T[[1]][, ck]),
+        recursive_indicator = cbind(rr$Q[[1]][, "rec_ind|NA"], rr$T[[1]][, "rec_ind|NA"]))
+    }
+  }
+  rows <- list()
+  for (est in c("empirical", "kernel", "recursive_indicator", "recursive_kernel")) for (i in seq_len(B)) {
+    g <- function(tl) t(vapply(P, function(p) stats[[paste(tl, p)]][[est]][i, ], numeric(2)))
+    U <- g("up"); L <- g("lo")
+    th <- fit_stable_H(list(p = P, Q_up = U[, 1], S_up = U[, 2], Q_lo = L[, 1], S_lo = L[, 2]))
+    rows[[length(rows) + 1]] <- data.frame(alpha0 = al0, beta0 = be0, rep = (b - 1) * B + i, estimator = est,
+      alpha = th[1], beta = th[2], gamma = sc[i] * th[3], zeta = med[i] + sc[i] * th[4])
+  }
+  do.call(rbind, rows)
+}
+run_stable <- function(cfg) {
+  B <- min(50L, cfg$M_stable); nb <- ceiling(cfg$M_stable / B)
+  f <- file.path(cfg$out, sprintf("stable_params_n%d_M%d.rds", cfg$n_stable, nb * B))
+  if (file.exists(f)) return(readRDS(f))
+  jobs <- expand.grid(al0 = cfg$stable_alpha, be0 = cfg$stable_beta, b = seq_len(nb))
+  rl <- par_map(seq_len(nrow(jobs)), function(j) run_stable_block(jobs$al0[j], jobs$be0[j], jobs$b[j], cfg, B), cfg$cores)
+  res <- do.call(rbind, rl); saveRDS(res, f); res
+}
+```
+
+```{r stable-run, eval = isTRUE(get0("params", ifnotfound = list(run_stable = TRUE))$run_stable), fig.width = 16, fig.height = 9}
+ST <- run_stable(cfg)
+ssum <- ST %>% group_by(alpha0, beta0, estimator) %>%
+  summarise(M = n(), `Failure rate` = mean(!is.finite(alpha)),
+            `Bias alpha` = mean(alpha - alpha0, na.rm = TRUE), `RMSE alpha` = sqrt(mean((alpha - alpha0)^2, na.rm = TRUE)),
+            `Bias beta` = mean(beta - beta0, na.rm = TRUE), `RMSE beta` = sqrt(mean((beta - beta0)^2, na.rm = TRUE)),
+            `RMSE log gamma` = sqrt(mean(log(gamma)^2, na.rm = TRUE)), `RMSE zeta` = sqrt(mean(zeta^2, na.rm = TRUE)),
+            .groups = "drop") %>% rename(alpha = alpha0, beta = beta0, `Superquantile estimator` = estimator)
+write.csv(ssum, file.path(cfg$out, "stable_params_summary.csv"), row.names = FALSE)
+save_latex(ssum, "stable_parameters", digits = 4,
+  caption = sprintf("Estimation of the stable parameters from superquantile estimating equations (Theorem 6.1, quadratic generator, both tails), n = %d.", cfg$n_stable))
+sl <- ST %>% filter(is.finite(alpha)) %>%
+  transmute(setting = sprintf("alpha = %.2f, beta = %.2f", alpha0, beta0), estimator,
+            `alpha-hat - alpha` = alpha - alpha0, `beta-hat - beta` = beta - beta0) %>%
+  pivot_longer(c(`alpha-hat - alpha`, `beta-hat - beta`), names_to = "parameter", values_to = "error")
+pl <- ggplot(sl, aes(estimator, error, fill = estimator)) + geom_hline(yintercept = 0, linetype = 2) +
+  geom_boxplot(outlier.size = 0.4) + facet_grid(parameter ~ setting, scales = "free_y") +
+  labs(x = NULL, y = "Estimation error", fill = NULL,
+       title = "Stable parameters from superquantile estimating equations (Theorem 6.1)") +
+  theme_article(13) + theme(axis.text.x = element_text(angle = 25, hjust = 1))
+emit_plot(pl, sl, "fig_stable_params", 16, 9)
+```
+
+# Summary
+
+```{r synthesis, eval = isTRUE(get0("params", ifnotfound = list(run_main = TRUE))$run_main)}
+best <- tab1 %>% group_by(Distribution, Generator, p, Regime) %>%
+  summarise(`Best (rel. RMSE)` = as.character(Method[which.min(`Rel. RMSE`)]), `Min. rel. RMSE` = min(`Rel. RMSE`),
+            `Worst (rel. RMSE)` = as.character(Method[which.max(`Rel. RMSE`)]), `Max. rel. RMSE` = max(`Rel. RMSE`),
+            .groups = "drop")
+save_latex(best, "best_worst", digits = 4, caption = "Best and worst estimator (relative RMSE) in each scenario, final n.")
+```
+
+All tables are also written in LaTeX (booktabs) in `out/tables/` and all figures in PDF in `out/figures/`.
+
+```{r session}
+sessionInfo()
+```

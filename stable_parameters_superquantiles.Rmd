@@ -1,0 +1,571 @@
+---
+title: "Stable-law parameters from Bregman superquantiles"
+subtitle: "Five superquantile estimators, three Bregman generators, five optimizers and an ECF benchmark"
+author: "Solym Manou-Abi, Yousri Slaoui"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+params:
+  mode: "quick"            # "quick" (minutes), "medium", "paper" (long)
+  cores: 1                 # parallel::mclapply (forced to 1 on Windows)
+  p_levels: "0.25,0.5,0.75,0.95"
+  two_sided: true          # use both tails: -X ~ S0(alpha, -beta, gamma, -zeta)
+  a_bw: 0.3                # bandwidth exponent h_n = n^(-a) (undersmoothing a > 1/4)
+  out: "stable_out"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 14, fig.height = 8, dpi = 100)
+for (pk in c("stabledist", "ggplot2", "dplyr", "tidyr", "knitr"))
+  if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk)
+suppressPackageStartupMessages({ library(ggplot2); library(dplyr); library(tidyr); library(knitr) })
+RNGkind("L'Ecuyer-CMRG")
+if (!exists("params"))   # interactive use: recreate the YAML defaults (params is read-only when knitting)
+  params <- list(mode = "quick", cores = 1, p_levels = "0.25,0.5,0.75,0.95", two_sided = TRUE, a_bw = 0.3, out = "stable_out")
+`%||%` <- function(a, b) if (is.null(a)) b else a
+```
+
+# Method
+
+For $X\sim S_0(\alpha,\beta,\gamma,\zeta)$ with $1<\alpha\le2$, Theorem 6.1 of the revised article gives the exact
+expected excess over a threshold $Q$,
+$$H(Q;\theta)=\mathbb E_\theta[(X-Q)^+]=\tfrac12\big(\zeta-\beta\gamma\tan\tfrac{\pi\alpha}{2}-Q\big)
++\tfrac{\gamma}{\pi}\Big[\Gamma\big(1-\tfrac1\alpha\big)-g_{-1}\Big(\tfrac{Q-\zeta+\beta\gamma\tan(\pi\alpha/2)}{\gamma}\,\Big|\,\alpha,\beta\Big)\Big],$$
+$$g_{-1}(x\,|\,\alpha,\beta)=\int_0^\infty\big[\cos\big(xr-\beta\tan\tfrac{\pi\alpha}{2}\,r^\alpha\big)-1\big]\,r^{-2}e^{-r^\alpha}\,dr .$$
+At a level $p$ with quantile $Q_p$, the superquantile statistic $T_p=\gamma'(SQ_p^\gamma)=\mathbb E[\gamma'(X)\mid X>Q_p]$ satisfies
+$$T_p=\gamma'(Q_p)+\gamma''(Q_p)\,\frac{H(Q_p;\theta)}{1-p}+R_p,\qquad R_p=0\ \text{for the quadratic generator}.$$
+Each superquantile estimator supplies $(\widehat Q_{p_i},\widehat T_{p_i})$ at levels $p_1,\dots,p_k$ on the upper tail and,
+when `two_sided = TRUE`, on the lower tail through $-X\sim S_0(\alpha,-\beta,\gamma,-\zeta)$. The parameters minimise
+$$J(\theta)=\sum_i\Big[\frac{\widehat T_{p_i}-T_\theta(\widehat Q_{p_i})}{1+|\widehat T_{p_i}|}\Big]^2 .$$
+The data are first standardised by the median and the robust scale IQR/1.349 (location–scale equivariance of $S_0$),
+and $(\gamma,\zeta)$ are mapped back at the end.
+
+**Corrections with respect to the previous version (S11).**
+
+* The equation is **exact only for the quadratic generator**. For `asinh` and `x + a cos x` the remainder $R_p$ is a
+  second-order term and produces a systematic bias; it is quantified in Section 3 and these generators are reported as
+  *linearised* fits.
+* The recursive estimators now follow the revised algorithm: empirical warm start on
+  $n_0=\max\{200,\lceil20/(1-p)\rceil\}$ observations and Newton gains $\hat A^{-1}$ (Corollary 3.4), with step $1/n$
+  (indicator and kernel versions) or step $n^{-0.8}$, $h_n=n^{-0.4}$, with Polyak–Ruppert averaging. Newton gains (or averaging) are
+  needed to reach the batch variance $\sigma^2$. The former version started from the first observation and overshot.
+* Both tails are used by default (one-sided fits poorly identify $\beta$ and $\zeta$).
+* The kernel bandwidth is $h_n=n^{-0.3}$ on the standardised scale (undersmoothing, $a>1/4$).
+* An empirical-characteristic-function (ECF) minimum-distance estimator is added as a benchmark, with the
+  empirical-versus-fitted ECF diagnostic.
+* $g_{-1}$ is cross-checked against an independent adaptive quadrature of Nolan's integral (with the
+  $\cos(\cdot)-1$ form, which makes the integrand integrable at $r=0$).
+
+# Configuration and core functions
+
+```{r config}
+num <- function(s) as.numeric(strsplit(as.character(s), ",")[[1]])
+MODES <- list(
+  quick  = list(alpha = 1.5,              beta = 0.3,      n = 2000,               M = 10,
+                optimizers = c("lbfgsb", "neldermead", "nlminb")),
+  medium = list(alpha = c(1.3, 1.6, 1.9), beta = c(0, 0.5), n = 2000,              M = 50,
+                optimizers = c("lbfgsb", "neldermead", "nlminb", "de", "de+lbfgsb")),
+  paper  = list(alpha = c(1.2, 1.5, 1.8), beta = c(0, 0.5), n = c(1000, 5000, 20000), M = 300,
+                optimizers = c("lbfgsb", "neldermead", "nlminb", "de", "de+lbfgsb")))
+cfg <- c(MODES[[params$mode]],
+         list(mode = params$mode, cores = if (.Platform$OS.type == "windows") 1L else max(1L, as.integer(params$cores)),
+              p_levels = num(params$p_levels), two_sided = isTRUE(params$two_sided), a_bw = as.numeric(params$a_bw),
+              out = params$out, seed = 20261110L))
+for (d in c("", "figures", "tables")) dir.create(file.path(cfg$out, d), showWarnings = FALSE, recursive = TRUE)
+ESTIMATORS <- c("empirical", "kernel", "recursive_indicator", "recursive_kernel", "recursive_pr")
+est_lab <- c(empirical = "Empirical", kernel = "Kernel", recursive_indicator = "Recursive indicator (Newton)",
+             recursive_kernel = "Recursive kernel (Newton)", recursive_pr = "Recursive kernel, PR averaging",
+             ecf = "ECF benchmark")
+str(cfg)
+```
+
+## Bregman generators, quadrature, $g_{-1}$ and $H$
+
+```{r core}
+make_generator <- function(name, s = 1, a = 0.5) {
+  switch(name,
+    quad = list(name = "quad", label = "Quadratic (exact)",
+                g1 = function(x) x, g2 = function(x) rep(1, length(x)), ginv = function(y) y),
+    asinh = list(name = "asinh", label = "asinh (linearised)",
+                 g1 = function(x) asinh(x / s), g2 = function(x) 1 / (s * sqrt(1 + (x / s)^2)),
+                 ginv = function(y) s * sinh(y)),
+    sin = list(name = "sin", label = "x + a cos x (linearised)",
+               g1 = function(x) x + a * cos(x), g2 = function(x) 1 - a * sin(x),
+               ginv = function(y) { x <- y; for (k in 1:60) x <- x - (x + a * cos(x) - y) / (1 - a * sin(x)); x }),
+    stop("Unknown generator: ", name))
+}
+GENS <- list(quad = make_generator("quad"), asinh = make_generator("asinh"), sin = make_generator("sin"))
+gen_lab <- vapply(GENS, `[[`, "", "label")
+
+gauss_legendre <- function(m) {
+  i <- seq_len(m - 1); b <- i / sqrt(4 * i^2 - 1)
+  J <- matrix(0, m, m); J[cbind(i, i + 1)] <- b; J[cbind(i + 1, i)] <- b
+  e <- eigen(J, symmetric = TRUE); o <- order(e$values)
+  list(x = e$values[o], w = 2 * e$vectors[1, o]^2)
+}
+.GL20 <- gauss_legendre(20); .GL40 <- gauss_legendre(40)
+
+#' g_{-1}(x | alpha, beta): composite Gauss-Legendre in r on [0, 34^(1/alpha)] (exp(-r^alpha) < 1e-14 beyond).
+#' The form -2 sin^2(u/2) = cos(u) - 1 avoids cancellation near r = 0.
+g_m1 <- function(x, alpha, beta) {
+  tn <- tan(pi * alpha / 2); R <- 34^(1 / alpha)
+  phase <- max(abs(x)) * R + abs(beta * tn) * R^alpha
+  npan <- min(400, max(8, ceiling(phase / 12)))
+  edges <- seq(0, R, length.out = npan + 1); a <- edges[-length(edges)]; b <- edges[-1]
+  half <- (b - a) / 2; mid <- (a + b) / 2
+  r <- as.vector(outer(.GL20$x, half) + matrix(mid, 20, npan, byrow = TRUE))
+  w <- as.vector(outer(.GL20$w, half)); er <- exp(-r^alpha) / r^2; rA <- r^alpha
+  vapply(x, function(xi) sum(w * (-2 * sin((xi * r - beta * tn * rA) / 2)^2) * er), numeric(1))
+}
+#' Theorem 6.1: E[(X - Q)^+], X ~ S0(alpha, beta, gam, zeta), alpha > 1 (vectorised in Q).
+H_stable <- function(Q, alpha, beta, gam = 1, zeta = 0) {
+  tn <- tan(pi * alpha / 2); z <- (Q - zeta + beta * gam * tn) / gam
+  0.5 * (zeta - beta * gam * tn - Q) + (gam / pi) * (base::gamma(1 - 1 / alpha) - g_m1(z, alpha, beta))
+}
+#' Model statistic T_theta(Q) = gamma'(Q) + gamma''(Q) H(Q; theta) / (1 - p)  (exact for quad).
+T_model <- function(Q, alpha, beta, gam, zeta, gen, p)
+  gen$g1(Q) + gen$g2(Q) * H_stable(Q, alpha, beta, gam, zeta) / (1 - p)
+```
+
+## Superquantile estimators
+
+All estimators return the quantile $\widehat Q_p$ and $\widehat T_p=\gamma'(\widehat{SQ}_p)$ at every level of `P`.
+The recursive estimators process the levels in parallel in one pass over the data.
+
+```{r estimators}
+robust_scale <- function(x) { s <- IQR(x) / 1.349; if (!is.finite(s) || s <= 0) s <- sd(x); if (!is.finite(s) || s <= 0) 1 else s }
+n0_rule <- function(p) as.integer(max(200, ceiling(20 / (1 - p))))
+
+est_emp <- function(x, P, gen) {
+  xs <- sort(x); n <- length(xs); G <- cumsum(rev(gen$g1(xs)))      # G[j] = sum of the j largest g1(x)
+  t(vapply(P, function(p) {
+    k <- ceiling(n * p - 1e-9); q <- xs[k]; up <- if (k < n) G[n - k] else 0
+    c(Q = q, T = ((k - n * p) * gen$g1(q) + up) / (n * (1 - p)))
+  }, numeric(2)))
+}
+kernel_quantile <- function(x, p, h, start) {
+  t <- start
+  for (it in 1:30) {
+    z <- (t - x) / h; Fv <- mean(pnorm(z)) - p; dv <- mean(dnorm(z)) / h
+    if (!is.finite(dv) || dv < 1e-12) break
+    st <- Fv / dv; t <- t - st
+    if (abs(st) < 1e-10 * (1 + abs(t))) return(t)
+  }
+  tryCatch(uniroot(function(t) mean(pnorm((t - x) / h)) - p, range(x) + c(-8, 8) * h)$root, error = function(e) NA_real_)
+}
+est_kernel <- function(x, P, gen, h) {
+  xs <- sort(x); n <- length(x)
+  t(vapply(P, function(p) {
+    q <- kernel_quantile(x, p, h, xs[ceiling(n * p - 1e-9)])
+    if (!is.finite(q)) return(c(Q = NA_real_, T = NA_real_))
+    a <- (q - x) / h
+    if (gen$name == "quad") return(c(Q = q, T = sum(x * pnorm(-a) + h * dnorm(a)) / (n * (1 - p))))
+    far <- a < -8; band <- abs(a) <= 8
+    ab <- a[band]; half <- (8 - ab) / 2; mid <- (8 + ab) / 2; Z <- outer(half, .GL40$x) + mid
+    s_band <- sum(drop((gen$g1(x[band] + h * Z) * dnorm(Z)) %*% .GL40$w) * half)
+    c(Q = q, T = (sum(gen$g1(x[far])) + s_band) / (n * (1 - p)))
+  }, numeric(2)))
+}
+#' Recursive estimators (revised algorithm) with Newton gains: warm start, gain 1/f_hat on Q and the
+#' control-variate correction -gamma'(Q)(W - p)/(1 - p) in the theta-recursion.
+#' type = "indicator": W = 1{X <= Q}, step 1/i; "kernel": W = Phi((Q - X)/h_i), h_i = i^-a, step 1/i;
+#' "pr": kernel version with step i^-0.8, h_i = i^-0.4 and Polyak-Ruppert averaging of the theta-iterates.
+est_recursive <- function(x, P, gen, type = c("kernel", "indicator", "pr"), a = 0.3, rho = 0.8) {
+  type <- match.arg(type); n <- length(x); r <- 1 - P
+  n0 <- min(max(vapply(P, n0_rule, 1L)), floor(n / 4))
+  w0 <- est_emp(x[1:n0], P, gen); Q <- w0[, "Q"]; T <- w0[, "T"]; Tbar <- T
+  x0 <- x[1:n0]; hp <- robust_scale(x0) * n0^(-0.2)
+  fq <- vapply(Q, function(q) mean(dnorm((q - x0) / hp)) / hp, 1)
+  gq <- 1 / pmax(fq, 0.1 * r / robust_scale(x0))
+  g1x <- gen$g1(x)
+  for (i in (n0 + 1):n) {
+    xi <- x[i]; st <- if (type == "pr") i^(-rho) else 1 / i
+    W <- if (type == "indicator") as.numeric(xi <= Q) else pnorm((Q - xi) * i^a)
+    T <- T - st * (T - g1x[i] * (1 - W) / r - gen$g1(Q) * (W - P) / r)
+    Q <- Q - st * gq * (W - P)
+    if (type == "pr") Tbar <- Tbar + (T - Tbar) / (i - n0)
+  }
+  cbind(Q = Q, T = if (type == "pr") Tbar else T)
+}
+superquantile_stats <- function(z, estimator, gen, P, a = 0.3) {
+  switch(estimator,
+    empirical           = est_emp(z, P, gen),
+    kernel              = est_kernel(z, P, gen, length(z)^(-a)),
+    recursive_indicator = est_recursive(z, P, gen, "indicator", a),
+    recursive_kernel    = est_recursive(z, P, gen, "kernel", a),
+    recursive_pr        = est_recursive(z, P, gen, "pr", a = 0.4, rho = 0.8),   # best choice (article, Table rho)
+    stop("Unknown estimator: ", estimator))
+}
+#' Statistics on the standardised sample, upper tail and (optionally) lower tail.
+stats_thm <- function(x, estimator, gen, P, a = 0.3, two_sided = TRUE) {
+  m <- median(x); s <- robust_scale(x); z <- (x - m) / s
+  up <- superquantile_stats(z, estimator, gen, P, a)
+  out <- list(levels = P, m = m, s = s, Q_up = up[, "Q"], T_up = up[, "T"])
+  if (two_sided) { lo <- superquantile_stats(-z, estimator, gen, P, a); out$Q_lo <- lo[, "Q"]; out$T_lo <- lo[, "T"] }
+  out
+}
+```
+
+## Objective function and optimizers
+
+Common interface: `f(par) -> list(par, value, conv)` on the box
+$\alpha\in[1.05,2]$, $\beta\in[-0.95,0.95]$, $\gamma\in[0.05,10]$, $\zeta\in[-5,5]$ (standardised scale).
+
+```{r optim}
+.lo <- c(1.05, -0.95, 0.05, -5); .hi <- c(2, 0.95, 10, 5)
+OPTIMIZERS <- c("lbfgsb", "neldermead", "nlminb", "de", "de+lbfgsb")
+obj_thm <- function(par, st, gen) {
+  a <- par[1]; b <- par[2]; g <- par[3]; zt <- par[4]
+  if (a <= 1.02 || a > 2 || abs(b) > 0.99 || g <= 0) return(1e10)
+  res <- (st$T_up - T_model(st$Q_up, a, b, g, zt, gen, st$levels)) / (1 + abs(st$T_up))
+  if (!is.null(st$Q_lo))
+    res <- c(res, (st$T_lo - T_model(st$Q_lo, a, -b, g, -zt, gen, st$levels)) / (1 + abs(st$T_lo)))
+  v <- sum(res^2); if (is.finite(v)) v else 1e10
+}
+.starts <- function() expand.grid(a = c(1.3, 1.6, 1.9), b = c(-0.4, 0, 0.4), g = c(0.5, 1), z = 0)
+.tr  <- function(u) c(1.05 + 0.95 * plogis(u[1]), 0.95 * tanh(u[2]), exp(u[3]), 5 * tanh(u[4]))   # R^4 -> box
+.inv <- function(p) c(qlogis((p[1] - 1.05) / 0.95), atanh(p[2] / 0.95), log(p[3]), atanh(p[4] / 5))
+.multistart <- function(f, solver, k = 3) {
+  S <- .starts(); v0 <- apply(S, 1, f); best <- NULL
+  for (i in order(v0)[seq_len(k)]) {
+    fit <- tryCatch(solver(as.numeric(S[i, ])), error = function(e) NULL)
+    if (!is.null(fit) && is.finite(fit$value) && (is.null(best) || fit$value < best$value)) best <- fit
+  }
+  if (is.null(best)) { i <- which.min(v0); best <- list(par = as.numeric(S[i, ]), value = v0[i], conv = 99L) }
+  best
+}
+opt_lbfgsb <- function(f) .multistart(f, function(s0) {
+  o <- optim(s0, f, method = "L-BFGS-B", lower = .lo, upper = .hi, control = list(maxit = 200))
+  list(par = o$par, value = o$value, conv = o$convergence) })
+opt_nm <- function(f) .multistart(function(p) f(p), function(s0) {
+  o <- optim(.inv(pmin(pmax(s0, .lo + 1e-6), .hi - 1e-6)), function(u) f(.tr(u)), method = "Nelder-Mead",
+             control = list(maxit = 800, reltol = 1e-10))
+  list(par = .tr(o$par), value = o$value, conv = o$convergence) })
+opt_nlminb <- function(f) .multistart(f, function(s0) {
+  o <- nlminb(s0, f, lower = .lo, upper = .hi, control = list(iter.max = 300))
+  list(par = o$par, value = o$objective, conv = o$convergence) })
+opt_de <- function(f, NP = 40, G = 60, Fw = 0.7, CR = 0.8) {          # DE/rand/1/bin (global search)
+  d <- 4; Pm <- sweep(sweep(matrix(runif(NP * d), NP, d), 2, .hi - .lo, "*"), 2, .lo, "+"); v <- apply(Pm, 1, f)
+  for (g in seq_len(G)) for (i in seq_len(NP)) {
+    idx <- sample(setdiff(seq_len(NP), i), 3)
+    mut <- pmin(pmax(Pm[idx[1], ] + Fw * (Pm[idx[2], ] - Pm[idx[3], ]), .lo), .hi)
+    cross <- runif(d) < CR; cross[sample.int(d, 1)] <- TRUE
+    trial <- ifelse(cross, mut, Pm[i, ]); vt <- f(trial)
+    if (vt <= v[i]) { Pm[i, ] <- trial; v[i] <- vt }
+  }
+  i <- which.min(v); list(par = Pm[i, ], value = v[i], conv = 0L)
+}
+opt_hybrid <- function(f) {                                           # DE exploration + L-BFGS-B polishing
+  d <- opt_de(f, NP = 30, G = 30)
+  o <- tryCatch(optim(d$par, f, method = "L-BFGS-B", lower = .lo, upper = .hi, control = list(maxit = 200)),
+                error = function(e) NULL)
+  if (!is.null(o) && o$value <= d$value) list(par = o$par, value = o$value, conv = o$convergence) else d
+}
+run_optimizer <- function(f, method) switch(method,
+  lbfgsb = opt_lbfgsb(f), neldermead = opt_nm(f), nlminb = opt_nlminb(f), de = opt_de(f), `de+lbfgsb` = opt_hybrid(f),
+  stop("Unknown optimizer: ", method))
+
+fit_from_stats <- function(st, gen, optimizer = "nlminb") {
+  cnt <- 0L
+  f <- function(par) { cnt <<- cnt + 1L; tryCatch(obj_thm(par, st, gen), error = function(e) 1e10) }
+  t0 <- proc.time()[["elapsed"]]; o <- run_optimizer(f, optimizer); tm <- proc.time()[["elapsed"]] - t0
+  list(alpha = o$par[1], beta = o$par[2], gamma = st$s * o$par[3], zeta = st$m + st$s * o$par[4],
+       obj = o$value, conv = o$conv, nfev = cnt, time_opt = tm)
+}
+fit_stable_sq <- function(x, estimator = "empirical", gen = GENS$quad, optimizer = "nlminb",
+                          P = cfg$p_levels, a = cfg$a_bw, two_sided = cfg$two_sided) {
+  t0 <- proc.time()[["elapsed"]]; st <- stats_thm(x, estimator, gen, P, a, two_sided)
+  r <- fit_from_stats(st, gen, optimizer); r$time_stats <- proc.time()[["elapsed"]] - t0 - r$time_opt; r
+}
+```
+
+## ECF benchmark (minimum distance on the characteristic function)
+
+$\varphi(t)=\exp\!\big[-\gamma^\alpha|t|^\alpha\big(1+i\beta\tan\tfrac{\pi\alpha}2\,\mathrm{sign}(t)(|\gamma t|^{1-\alpha}-1)\big)+i\zeta t\big]$
+($S_0$ parametrisation, $\alpha\neq1$); the weighted distance $\sum_k w_k|\hat\varphi_n(t_k)-\varphi(t_k)|^2$, $t_k\in[0.1,3]$,
+$w_k\propto e^{-t_k/2}$, is minimised on the standardised data from several starting points.
+
+```{r ecf}
+stable_cf <- function(t, alpha, beta, gamma, delta) {          # t > 0
+  if (abs(alpha - 1) < 1e-4) alpha <- 1 + 1e-4
+  exp(-gamma^alpha * t^alpha * (1 + 1i * beta * tan(pi * alpha / 2) * ((gamma * t)^(1 - alpha) - 1)) + 1i * delta * t)
+}
+fit_stable_ecf <- function(x, t_grid = seq(0.1, 3, length.out = 60)) {
+  t0 <- proc.time()[["elapsed"]]
+  m <- median(x); s <- robust_scale(x); z <- (x - m) / s
+  phi_n <- vapply(t_grid, function(t) mean(exp(1i * t * z)), complex(1))
+  w <- exp(-t_grid / 2); w <- w / sum(w)
+  obj <- function(par) {
+    if (par[1] <= 0.5 || par[1] > 2 || abs(par[2]) > 1 || par[3] <= 0) return(1e10)
+    sum(w * Mod(phi_n - stable_cf(t_grid, par[1], par[2], par[3], par[4]))^2)
+  }
+  starts <- expand.grid(a = c(1.2, 1.5, 1.8), b = c(-0.5, 0, 0.5)); best <- NULL
+  for (k in seq_len(nrow(starts))) {
+    fit <- tryCatch(optim(c(starts$a[k], starts$b[k], 1, 0), obj, method = "L-BFGS-B",
+                          lower = c(0.51, -1, 1e-3, -50), upper = c(2, 1, 50, 50)), error = function(e) NULL)
+    if (!is.null(fit) && (is.null(best) || fit$value < best$value)) best <- fit
+  }
+  q <- best$par
+  list(alpha = q[1], beta = q[2], gamma = s * q[3], zeta = m + s * q[4], obj = best$value,
+       time_opt = proc.time()[["elapsed"]] - t0)
+}
+```
+
+## Utilities
+
+```{r utils}
+theme_article <- function(base = 15) theme_bw(base_size = base) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"), panel.grid.minor = element_blank())
+emit_plot <- function(plot, data, name, width = 14, height = 8) {
+  if (is.null(data) || NROW(data) == 0) { message("No data for figure '", name, "': skipped."); return(invisible(NULL)) }
+  print(plot)
+  ggsave(file.path(cfg$out, "figures", paste0(name, ".pdf")), plot, width = width, height = height,
+         device = if (capabilities("cairo")) cairo_pdf else "pdf")
+}
+latex_escape <- function(s) gsub("([_%&#$])", "\\\\\\1", s)
+save_latex <- function(df, name, caption, digits = 3) {
+  tex <- knitr::kable(df, format = "latex", booktabs = TRUE, digits = digits, caption = latex_escape(caption),
+                      label = name, linesep = "", row.names = FALSE)
+  writeLines(tex, file.path(cfg$out, "tables", paste0(name, ".tex")))
+  knitr::kable(df, digits = digits, caption = caption, row.names = FALSE)
+}
+par_map <- function(X, FUN, cores) if (cores > 1) parallel::mclapply(X, FUN, mc.cores = cores, mc.set.seed = TRUE) else lapply(X, FUN)
+```
+
+# Checks
+
+## $g_{-1}$ against an independent quadrature of Nolan's integral, and $H$
+
+The reference evaluates $\int_0^\infty[\cos(xr-\beta\tan(\pi\alpha/2)r^\alpha)-1]r^{-2}e^{-r^\alpha}dr$ with `integrate`
+on $[0,1]\cup[1,\infty)$ (no `pracma` needed). Note that the integrand must contain $\cos(\cdot)-1$: with $\cos(\cdot)$
+alone the integral diverges at $r=0$.
+
+
+```{r}
+g_m1_nolan <- function(x, alpha, beta) {
+  tn <- tan(pi * alpha / 2)
+  f <- function(r) {
+    u <- x * r - beta * tn * r^alpha
+    ifelse(r == 0, -x^2 / 2, -2 * sin(u / 2)^2 / r^2 * exp(-r^alpha))
+  }
+  integrate(f, 0, 1, subdivisions = 5000L, rel.tol = 1e-11)$value +
+    integrate(f, 1, Inf, subdivisions = 5000L, rel.tol = 1e-11)$value
+}
+
+grid <- expand.grid(x = c(-5, -1, 0, 0.5, 2, 8), alpha = c(1.2, 1.5, 1.9), beta = c(-0.7, 0, 0.5))
+grid$g_GL <- mapply(function(x, a, b) g_m1(x, a, b), grid$x, grid$alpha, grid$beta)
+grid$g_Nolan <- mapply(g_m1_nolan, grid$x, grid$alpha, grid$beta)
+grid$abs_diff <- abs(grid$g_GL - grid$g_Nolan)
+
+chk <- data.frame(
+  Check = c("max |g_GL - g_Nolan| over 54 points", "H(zeta), alpha = 2: gamma/sqrt(pi)", "H location-scale equivariance",
+            "H = density quadrature, S0(1.5, 0.5), Q = 1"),
+  Value = c(max(grid$abs_diff), H_stable(0, 2, 0), H_stable(3, 1.5, 0.5, 2, 1),
+            H_stable(1, 1.5, 0.5)),
+  Target = c(0, 1 / sqrt(pi), 2 * H_stable(1, 1.5, 0.5),
+             integrate(function(x) (x - 1) * stabledist::dstable(x, 1.5, 0.5, 1, 0, pm = 0), 1, 400)$value +
+               integrate(function(x) (x - 1) * 1.5 * 1.5 * base::gamma(1.5) * sin(0.75 * pi) / pi * x^(-2.5), 400, Inf)$value))
+
+chk$Status <- ifelse(abs(chk$Value - chk$Target) <= c(1e-7, 1e-6, 1e-8, 5e-3) * pmax(1, abs(chk$Target)), "PASS", "FAIL")
+
+save_latex(chk, "stable_checks", digits = 6, caption = "Numerical checks of g_{-1} and of the excess function H (Theorem 6.1).")
+```
+
+
+## Size of the linearisation remainder for non-quadratic generators
+
+For the true parameters, the exact statistic $T_p=\mathbb E[\gamma'(X)\mid X>Q_p]$ (density quadrature with a Pareto tail)
+is compared with the model $\gamma'(Q_p)+\gamma''(Q_p)H(Q_p)/(1-p)$. The relative remainder is zero for the quadratic generator
+and shows how much bias the linearised fits inherit.
+
+```{r check-lin}
+T_exact <- function(p, alpha, beta, gen) {
+  Q <- stabledist::qstable(p, alpha, beta, 1, 0, pm = 0)
+  d <- function(x) stabledist::dstable(x, alpha, beta, 1, 0, pm = 0)
+  Kt <- (1 + beta) * base::gamma(alpha) * sin(pi * alpha / 2) / pi
+  L <- max(Q, 0) + 200
+  I <- integrate(function(x) gen$g1(x) * d(x), Q, max(Q, 0) + 10, subdivisions = 2000L)$value +
+    integrate(function(x) gen$g1(x) * d(x), max(Q, 0) + 10, L, subdivisions = 2000L)$value +
+    integrate(function(x) gen$g1(x) * alpha * Kt * x^(-alpha - 1), L, Inf, subdivisions = 2000L)$value
+  c(Q = Q, T = I / (1 - p))
+}
+lin <- do.call(rbind, lapply(names(GENS), function(g) do.call(rbind, lapply(cfg$p_levels, function(p) {
+  e <- T_exact(p, 1.5, 0.3, GENS[[g]])
+  m <- T_model(e[["Q"]], 1.5, 0.3, 1, 0, GENS[[g]], p)
+  data.frame(Generator = gen_lab[[g]], p = p, `Exact T` = e[["T"]], `Model T` = m,
+             `Relative remainder` = (m - e[["T"]]) / abs(e[["T"]]), check.names = FALSE)
+}))))
+save_latex(lin, "linearisation_remainder", digits = 4,
+           caption = "Exact superquantile statistic versus the Theorem 6.1 model, S0(1.5, 0.3, 1, 0).")
+```
+
+# One-sample illustration and ECF diagnostic
+
+```{r one-sample, fig.width = 14, fig.height = 6}
+set.seed(cfg$seed); x <- stabledist::rstable(5000, alpha = 1.5, beta = 0.3, gamma = 1, delta = 0, pm = 0)
+one <- list()
+for (E in ESTIMATORS) for (g in names(GENS)) {
+  st <- stats_thm(x, E, GENS[[g]], cfg$p_levels, cfg$a_bw, cfg$two_sided)
+  for (o in c("lbfgsb", "neldermead", "nlminb")) {
+    r <- fit_from_stats(st, GENS[[g]], o)
+    one[[length(one) + 1]] <- data.frame(Estimator = est_lab[[E]], Generator = gen_lab[[g]], Optimizer = o,
+      alpha = r$alpha, beta = r$beta, gamma = r$gamma, zeta = r$zeta, Objective = r$obj, Evaluations = r$nfev)
+  }
+}
+ecf1 <- fit_stable_ecf(x)
+one[[length(one) + 1]] <- data.frame(Estimator = "ECF benchmark", Generator = "-", Optimizer = "L-BFGS-B",
+  alpha = ecf1$alpha, beta = ecf1$beta, gamma = ecf1$gamma, zeta = ecf1$zeta, Objective = ecf1$obj, Evaluations = NA)
+one <- do.call(rbind, one)
+save_latex(one, "one_sample_fits", digits = 4,
+           caption = "Fits on one sample of size 5000 from S0(1.5, 0.3, 1, 0), all estimators, generators and optimizers.")
+
+## ECF: empirical versus fitted, for the ECF benchmark and the exact (quadratic) superquantile fit
+fq <- one %>% filter(Estimator == "Empirical", Generator == gen_lab[["quad"]], Optimizer == "nlminb")
+tg <- seq(0.05, 4, length.out = 200); m0 <- median(x); s0 <- robust_scale(x); zz <- (x - m0) / s0
+phi_n <- vapply(tg, function(t) mean(exp(1i * t * zz)), complex(1))
+cf_of <- function(a, b, g, z) stable_cf(tg, a, b, g / s0, (z - m0) / s0)
+ecf_df <- rbind(
+  data.frame(t = tg, Re = Re(phi_n), Im = Im(phi_n), source = "Empirical CF"),
+  data.frame(t = tg, Re = Re(cf_of(ecf1$alpha, ecf1$beta, ecf1$gamma, ecf1$zeta)),
+             Im = Im(cf_of(ecf1$alpha, ecf1$beta, ecf1$gamma, ecf1$zeta)), source = "Fitted stable (ECF)"),
+  data.frame(t = tg, Re = Re(cf_of(fq$alpha, fq$beta, fq$gamma, fq$zeta)),
+             Im = Im(cf_of(fq$alpha, fq$beta, fq$gamma, fq$zeta)), source = "Fitted stable (superquantiles, quadratic)"),
+  data.frame(t = tg, Re = Re(cf_of(1.5, 0.3, 1, 0)), Im = Im(cf_of(1.5, 0.3, 1, 0)), source = "True law")) %>%
+  pivot_longer(c(Re, Im), names_to = "part", values_to = "value") %>%
+  mutate(part = factor(ifelse(part == "Re", "Real part", "Imaginary part"), levels = c("Real part", "Imaginary part")))
+pl <- ggplot(ecf_df, aes(t, value, colour = source, linetype = source)) + geom_line(linewidth = 0.9) +
+  facet_wrap(~ part, scales = "free_y") +
+  scale_linetype_manual(values = c("solid", "22", "42", "dotted")) +
+  labs(x = "t (standardised data)", y = "Characteristic function", colour = NULL, linetype = NULL,
+       title = "Empirical versus fitted characteristic function, S0(1.5, 0.3, 1, 0), n = 5000") +
+  theme_article() + guides(colour = guide_legend(nrow = 2))
+emit_plot(pl, ecf_df, "fig_ecf_empirical_vs_fitted", 14, 6)
+```
+
+```{r qq, fig.width = 10, fig.height = 7}
+n1 <- length(x); idx <- unique(pmin(pmax(round(c(seq(1, n1, length.out = 150), n1 + 1 - 10^seq(0, log10(0.3 * n1), length.out = 60))), 1), n1))
+pp <- (idx - 0.5) / n1
+qq <- rbind(
+  data.frame(theoretical = stabledist::qstable(pp, ecf1$alpha, ecf1$beta, ecf1$gamma, ecf1$zeta, pm = 0),
+             empirical = sort(x)[idx], fit = "ECF"),
+  data.frame(theoretical = stabledist::qstable(pp, fq$alpha, fq$beta, fq$gamma, fq$zeta, pm = 0),
+             empirical = sort(x)[idx], fit = "Superquantiles (quadratic)"))
+pl <- ggplot(qq, aes(theoretical, empirical, colour = fit)) + geom_abline(linetype = 2) + geom_point(size = 1.2, alpha = 0.7) +
+  labs(x = "Fitted stable quantile", y = "Sample quantile", colour = NULL, title = "QQ-plot of the fitted stable laws") + theme_article()
+emit_plot(pl, qq, "fig_stable_qq", 10, 7)
+```
+
+# Monte Carlo study
+
+For each replication the **same sample** and the **same superquantile statistics** are used by all optimizers (paired
+comparison); the ECF estimator is computed on the same sample. True values $\gamma=1$, $\zeta=0$.
+
+```{r mc-engine}
+sim_rep <- function(alpha0, beta0, n, rep_id) {
+  set.seed(cfg$seed + 7919L * rep_id + round(1000 * alpha0) + round(100 * beta0) * 31L + n)
+  x <- stabledist::rstable(n, alpha = alpha0, beta = beta0, gamma = 1, delta = 0, pm = 0); rows <- list()
+  for (E in ESTIMATORS) for (g in names(GENS)) {
+    t0 <- proc.time()[["elapsed"]]
+    st <- tryCatch(stats_thm(x, E, GENS[[g]], cfg$p_levels, cfg$a_bw, cfg$two_sided), error = function(e) NULL)
+    ts <- proc.time()[["elapsed"]] - t0
+    for (o in cfg$optimizers) {
+      r <- if (is.null(st)) NULL else tryCatch(fit_from_stats(st, GENS[[g]], o), error = function(e) NULL)
+      rows[[length(rows) + 1]] <- data.frame(estimator = E, gen = g, optimizer = o,
+        alpha_hat = r$alpha %||% NA_real_, beta_hat = r$beta %||% NA_real_, gamma_hat = r$gamma %||% NA_real_,
+        zeta_hat = r$zeta %||% NA_real_, obj = r$obj %||% NA_real_, nfev = r$nfev %||% NA_integer_,
+        time_stats = ts, time_opt = r$time_opt %||% NA_real_)
+    }
+  }
+  e <- tryCatch(fit_stable_ecf(x), error = function(e) NULL)
+  rows[[length(rows) + 1]] <- data.frame(estimator = "ecf", gen = "-", optimizer = "L-BFGS-B",
+    alpha_hat = e$alpha %||% NA_real_, beta_hat = e$beta %||% NA_real_, gamma_hat = e$gamma %||% NA_real_,
+    zeta_hat = e$zeta %||% NA_real_, obj = e$obj %||% NA_real_, nfev = NA_integer_, time_stats = 0,
+    time_opt = e$time_opt %||% NA_real_)
+  out <- do.call(rbind, rows); out$alpha0 <- alpha0; out$beta0 <- beta0; out$n <- n; out$rep <- rep_id; out
+}
+run_mc <- function() {
+  res <- list()
+  for (a0 in cfg$alpha) for (b0 in cfg$beta) for (n in cfg$n) {
+    f <- file.path(cfg$out, sprintf("mc_a%.2f_b%.2f_n%d_M%d_%s.rds", a0, b0, n, cfg$M, paste(cfg$optimizers, collapse = "-")))
+    if (file.exists(f)) { res[[f]] <- readRDS(f); next }
+    message(sprintf("alpha = %.2f, beta = %.2f, n = %d, M = %d", a0, b0, n, cfg$M))
+    r <- do.call(rbind, par_map(seq_len(cfg$M), function(m) tryCatch(sim_rep(a0, b0, n, m), error = function(e) NULL), cfg$cores))
+    saveRDS(r, f); res[[f]] <- r
+  }
+  do.call(rbind, res)
+}
+```
+
+```{r mc-run}
+t_mc <- system.time(MC <- run_mc())
+message(sprintf("Monte Carlo: %.1f min", t_mc[["elapsed"]] / 60))
+MC$ok <- is.finite(MC$alpha_hat) & is.finite(MC$beta_hat)
+MC$est_lab <- factor(est_lab[MC$estimator], levels = est_lab)
+MC$gen_lab <- ifelse(MC$gen == "-", "ECF", gen_lab[MC$gen])
+MC$setting <- sprintf("alpha = %.2f, beta = %.2f, n = %d", MC$alpha0, MC$beta0, MC$n)
+write.csv(MC, file.path(cfg$out, "stable_mc_raw.csv"), row.names = FALSE)
+
+summ <- MC %>% group_by(alpha0, beta0, n, est_lab, gen_lab, optimizer) %>%
+  summarise(M = n(), `Failure rate` = mean(!ok),
+            `Bias alpha` = mean((alpha_hat - alpha0)[ok]), `RMSE alpha` = sqrt(mean((alpha_hat - alpha0)[ok]^2)),
+            `Bias beta` = mean((beta_hat - beta0)[ok]), `RMSE beta` = sqrt(mean((beta_hat - beta0)[ok]^2)),
+            `RMSE log gamma` = sqrt(mean(log(gamma_hat[ok])^2)), `RMSE zeta` = sqrt(mean(zeta_hat[ok]^2)),
+            `alpha at bound` = mean(alpha_hat[ok] > 1.99), `Mean time (s)` = mean(time_stats + time_opt, na.rm = TRUE),
+            `Evaluations` = mean(nfev, na.rm = TRUE), .groups = "drop") %>%
+  rename(alpha = alpha0, beta = beta0, Estimator = est_lab, Generator = gen_lab, Optimizer = optimizer)
+write.csv(summ, file.path(cfg$out, "stable_mc_summary.csv"), row.names = FALSE)
+save_latex(summ, "stable_mc_summary", digits = 4,
+           caption = sprintf("Stable parameters: bias and RMSE by superquantile estimator, generator and optimizer (M = %d; levels p = %s; %s).",
+                             cfg$M, paste(cfg$p_levels, collapse = ", "), if (cfg$two_sided) "both tails" else "upper tail"))
+```
+
+## Figures
+
+```{r mc-figs, fig.width = 18, fig.height = 10}
+d <- MC %>% filter(ok, estimator != "ecf")
+ecf_ref <- MC %>% filter(ok, estimator == "ecf") %>% group_by(setting) %>%
+  summarise(med_a = median(alpha_hat - alpha0), med_b = median(beta_hat - beta0), .groups = "drop")
+for (par in c("alpha", "beta")) {
+  d$err <- if (par == "alpha") d$alpha_hat - d$alpha0 else d$beta_hat - d$beta0
+  ecf_ref$yref <- if (par == "alpha") ecf_ref$med_a else ecf_ref$med_b
+  pl <- ggplot(d, aes(est_lab, err, fill = optimizer)) + geom_hline(yintercept = 0, linetype = 2) +
+    geom_hline(data = ecf_ref, aes(yintercept = yref), colour = "red", linetype = 3) +
+    geom_boxplot(outlier.size = 0.4) + facet_grid(gen_lab ~ setting) +
+    labs(x = NULL, y = if (par == "alpha") expression(hat(alpha) - alpha) else expression(hat(beta) - beta), fill = "Optimizer",
+         title = sprintf("Estimation error of %s from superquantile estimating equations", par),
+         subtitle = "Red dotted line: median error of the ECF benchmark") +
+    theme_article(13) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  emit_plot(pl, d, paste0("fig_", par, "_errors"), 18, 10)
+}
+s <- summ %>% filter(Estimator != "ECF benchmark", is.finite(`RMSE alpha`))
+se <- summ %>% filter(Estimator == "ECF benchmark")
+s$setting <- sprintf("alpha = %.2f, beta = %.2f, n = %d", s$alpha, s$beta, s$n)
+se$setting <- sprintf("alpha = %.2f, beta = %.2f, n = %d", se$alpha, se$beta, se$n)
+pl <- ggplot(s, aes(`Mean time (s)`, `RMSE alpha`, colour = Optimizer, shape = Estimator)) + geom_point(size = 3) +
+  geom_hline(data = se, aes(yintercept = `RMSE alpha`), colour = "red", linetype = 3) +
+  scale_x_log10() + facet_grid(Generator ~ setting, scales = "free_y") +
+  labs(x = "Mean computing time per fit (s, log scale)", y = "RMSE of alpha-hat",
+       title = "Accuracy versus computing time", subtitle = "Red dotted line: ECF benchmark") + theme_article(12)
+emit_plot(pl, s, "fig_optimizer_tradeoff", 18, 10)
+
+best <- summ %>% filter(is.finite(`RMSE alpha`)) %>% group_by(alpha, beta, n) %>%
+  slice_min(`RMSE alpha` + `RMSE beta`, n = 5, with_ties = FALSE) %>%
+  select(alpha, beta, n, Estimator, Generator, Optimizer, `RMSE alpha`, `RMSE beta`, `Mean time (s)`)
+save_latex(best, "stable_best_configurations", digits = 4,
+           caption = "Five best configurations (smallest RMSE(alpha) + RMSE(beta)) in each setting.")
+```
+
+**Reading guide.** The quadratic generator gives an *exact* estimating equation; any difference between the
+estimators then reflects their finite-sample accuracy (the empirical, kernel and recursive estimators with Newton gains
+or Polyak–Ruppert averaging share the asymptotic variance $\sigma^2$). Fits with `asinh` or
+`x + a cos x` carry the linearisation remainder quantified above and should be read as robustified approximations.
+Global optimizers (`de`, `de+lbfgsb`) mainly reduce the rare failures at the boundary $\alpha=2$, at a much higher cost.
+
+```{r session}
+sessionInfo()
+```

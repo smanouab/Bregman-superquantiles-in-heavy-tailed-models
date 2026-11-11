@@ -1,0 +1,923 @@
+---
+title: "Bregman superquantiles on real data: Danish fire losses, S&P 500 losses (GPD) and Boeing losses (stable law)"
+author: "Solym Manou-Abi, Yousri Slaoui"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+params:
+  quick: false             # TRUE: small Monte Carlo / bootstrap sizes (checks the notebook in a few minutes)
+  B: 2000                  # bootstrap replications for the confidence intervals
+  B_gof: 199               # parametric-bootstrap replications for the KS / CvM / AD tests of the stable model
+  B_mc: 499                # Monte Carlo replications of the exact QCV tests (B_mc + 1 should be a multiple of 20)
+  B_agg: 100               # bootstrap replications of the aggregation diagnostic
+  m_frac: 0.5              # subsample size of the m-out-of-n bootstrap, m = m_frac * n
+  min_exceed: 10           # a bootstrap/Wald interval is reported only if m (1 - p) >= min_exceed
+  a_rec: 0.4               # bandwidth h_n = s_hat * n^(-a_rec) of the recursive kernel estimators
+  rho_pr: 0.8              # step exponent of the Polyak-Ruppert recursion (article, Table rho)
+  a_ker: 0.3               # bandwidth h_n = s_hat * n^(-a_ker) of the batch kernel estimator
+  danish_csv: ""           # optional CSV (one column of losses, chronological order) if evir is unavailable
+  sp_csv: ""               # optional CSV with columns date, close if Yahoo Finance is unavailable
+  sp_from: "2010-01-01"
+  sp_to: "2026-10-31"
+  boeing_csv: ""           # optional CSV with columns date, close if Yahoo Finance is unavailable
+  boeing_from: "1997-07-01" # period of Borak, Haerdle & Weron (2005): 1 July 1997 - 31 December 2003, n = 1635
+  boeing_to: "2004-01-01"
+  R_tail: 500              # simulated samples from the fitted stable law for the tail-index calibration
+  out: "app_out"
+  seed: 20261111
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 12, fig.height = 7, dpi = 110)
+if (!exists("params"))
+  params <- list(quick = FALSE, B = 2000, B_gof = 199, B_mc = 499, B_agg = 100, m_frac = 0.5, min_exceed = 10,
+                 a_rec = 0.4, rho_pr = 0.8, a_ker = 0.3, danish_csv = "", sp_csv = "",
+                 sp_from = "2010-01-01", sp_to = "2026-10-31", boeing_csv = "", boeing_from = "1997-07-01",
+                 boeing_to = "2004-01-01", R_tail = 500, out = "app_out", seed = 20261111)
+for (pk in c("ggplot2", "knitr", "stabledist")) if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk)
+suppressPackageStartupMessages({ library(ggplot2); library(knitr) })
+QUICK  <- isTRUE(params$quick)
+B      <- if (QUICK) 200L else as.integer(params$B)
+B_gof  <- if (QUICK) 49L  else as.integer(params$B_gof)
+B_mc   <- if (QUICK) 99L  else as.integer(params$B_mc)
+B_agg  <- if (QUICK) 20L  else as.integer(params$B_agg)
+R_tail <- if (QUICK) 100L else as.integer(params$R_tail)
+HAS_MIXSTABLE <- requireNamespace("MixStable", quietly = TRUE)
+OUT <- params$out
+for (d in c("", "figures", "tables")) dir.create(file.path(OUT, d), showWarnings = FALSE, recursive = TRUE)
+set.seed(params$seed)
+```
+
+# Purpose
+
+Three datasets, with three roles.
+
+* **Danish fire losses** ($\xi\approx0.58>1/2$, infinite variance plausible) and **S&P 500 daily log-losses**
+  ($\xi\approx0.2$) illustrate the two asymptotic regimes of the article. Their tails are modelled by the GPD (POT);
+  the stable law does **not** fit them (goodness-of-fit tests reject it and $1/\widehat\alpha$ is incompatible with the
+  tail index).
+* **Boeing daily log-losses**, 1 July 1997 – 31 December 2003 ($n=1635$), the example of Borak, Härdle & Weron (2005)
+  for which the stable law is accepted by the Anderson–Darling and Kolmogorov tests, illustrate the stable model:
+  fit, goodness of fit, consistency of $1/\widehat\alpha$ with the tail estimators (calibrated by simulation, because
+  the Hill estimator is strongly biased for stable samples with $\alpha>1.5$: McCulloch, 1997; Weron, 2001), and the
+  superquantiles implied by the fitted stable law (Theorem 6.1) against the nonparametric estimates.
+
+On each dataset we estimate the CVaR (quadratic generator) and the $\asinh$-Bregman superquantile,
+$\gamma'(x)=\asinh(x/s)$ with $s=\mathrm{IQR}/1.349$ computed once on the full sample and then held fixed, with the five
+estimators of the article: empirical, batch kernel ($h_n=\widehat s\,n^{-0.3}$), recursive with indicator weights,
+recursive kernel ($h_n=\widehat s\,n^{-0.4}$, Newton gains), recursive with steps $n^{-0.8}$ and Polyak–Ruppert
+averaging. The stable diagnostics are: parametric-bootstrap KS/CvM/AD tests; QCV tests of Pitera, Chechkin &
+Wyłomańska (2022) and the exact Monte Carlo confidence set obtained by inverting them (Beaulieu, Dufour & Khalaf, 2014);
+Hill and QQ (Kratz & Resnick, 1996) estimators of $\xi$; aggregation diagnostic of Burnecki, Wyłomańska & Chechkin
+(2015); and, when installed, the package `MixStable`.
+
+All tables are written in LaTeX to `app_out/tables/` and all figures in PDF to `app_out/figures/`, with the file
+names used by the article: copy them next to `article_revise.tex`.
+
+# Function library
+
+```{r library}
+## ---------------------------------------------------------------- generators
+make_gen <- function(type = c("quad", "asinh"), s = 1) {
+  type <- match.arg(type)
+  if (type == "quad") list(type = "quad", s = NA,
+                           g1 = function(x) x, g2 = function(x) rep(1, length(x)), ginv = function(y) y)
+  else list(type = "asinh", s = s,
+            g1 = function(x) asinh(x / s), g2 = function(x) 1 / (s * sqrt(1 + (x / s)^2)),
+            ginv = function(y) s * sinh(y))
+}
+robust_scale <- function(x) { s <- IQR(x) / 1.349; if (!is.finite(s) || s <= 0) s <- sd(x); s }
+
+## ---------------------------------------------------------------- empirical estimator (Definition 2.1)
+#' Returns Q (empirical quantile), T = gamma'(SQ) and SQ.
+sq_emp <- function(x, p, gen) {
+  xs <- sort(x); n <- length(xs); k <- ceiling(n * p - 1e-9); q <- xs[k]
+  up <- if (k < n) sum(gen$g1(xs[(k + 1):n])) else 0
+  T <- ((k - n * p) * gen$g1(q) + up) / (n * (1 - p))
+  list(Q = q, T = T, SQ = gen$ginv(T))
+}
+
+## ---------------------------------------------------------------- kernel estimator (Definition 2.2)
+.GL <- local({ m <- 40; i <- seq_len(m - 1); b <- i / sqrt(4 * i^2 - 1)
+  J <- matrix(0, m, m); J[cbind(i, i + 1)] <- b; J[cbind(i + 1, i)] <- b
+  e <- eigen(J, symmetric = TRUE); o <- order(e$values); list(x = e$values[o], w = 2 * e$vectors[1, o]^2) })
+sq_kernel <- function(x, p, gen, h) {
+  n <- length(x); t <- quantile(x, p, type = 1, names = FALSE)
+  for (it in 1:50) {
+    z <- (t - x) / h; st <- (mean(pnorm(z)) - p) / (mean(dnorm(z)) / h); t <- t - st
+    if (abs(st) < 1e-12 * (1 + abs(t))) break
+  }
+  a <- (t - x) / h
+  if (gen$type == "quad") T <- sum(x * pnorm(-a) + h * dnorm(a)) / (n * (1 - p))
+  else {
+    far <- a < -8; band <- abs(a) <= 8; ab <- a[band]; half <- (8 - ab) / 2; mid <- (8 + ab) / 2
+    Z <- outer(half, .GL$x) + mid
+    T <- (sum(gen$g1(x[far])) + sum(drop((gen$g1(x[band] + h * Z) * dnorm(Z)) %*% .GL$w) * half)) / (n * (1 - p))
+  }
+  list(Q = t, T = T, SQ = gen$ginv(T))
+}
+
+## ---------------------------------------------------------------- recursive estimators (Section 3)
+#' Chronological Robbins-Monro recursion on theta = (Q, T), T = gamma'(SQ).
+#'   weight = "indicator": W_i = 1{X_i <= Q_{i-1}};  weight = "kernel": W_i = Phi((Q_{i-1} - X_i) / h_i),
+#'   h_i = s_hat * i^(-a).
+#'   type = "newton": steps 1/i with the Newton gain A^{-1} computed on a warm start of n0 observations and frozen;
+#'   type = "pr": steps i^(-rho), same gain, Polyak-Ruppert average of the T-iterates.
+#' Returns the final estimate and the trajectory.
+sq_recursive <- function(x, p, gen, type = c("newton", "pr"), weight = c("kernel", "indicator"),
+                         a = params$a_rec, rho = params$rho_pr, n0 = NULL, every = 10L) {
+  type <- match.arg(type); weight <- match.arg(weight); n <- length(x); r <- 1 - p
+  if (is.null(n0)) n0 <- min(max(200L, ceiling(20 / r)), floor(n / 4))
+  w <- sq_emp(x[1:n0], p, gen); Q <- w$Q; T <- w$T; Tbar <- T
+  x0 <- x[1:n0]; s0 <- robust_scale(x0); hp <- s0 * n0^(-0.2)
+  fq <- max(mean(dnorm((Q - x0) / hp)) / hp, 0.1 * r / s0)
+  g11 <- 1 / fq; g21 <- -gen$g1(Q) / r            # Newton gain A^-1, frozen after the warm start
+  gx <- gen$g1(x); path <- rep(NA_real_, n); path[n0] <- gen$ginv(T)
+  for (i in (n0 + 1):n) {
+    st <- if (type == "newton") 1 / i else i^(-rho)
+    W <- if (weight == "kernel") pnorm((Q - x[i]) / (s0 * i^(-a))) else as.numeric(x[i] <= Q)
+    d1 <- W - p; d2 <- T - gx[i] * (1 - W) / r
+    Q <- Q - st * g11 * d1
+    T <- T - st * (g21 * d1 + d2)
+    if (type == "pr") Tbar <- Tbar + (T - Tbar) / (i - n0 + 1)
+    path[i] <- gen$ginv(if (type == "pr") Tbar else T)
+  }
+  keep <- c(seq(n0, n, by = every), n)
+  list(SQ = path[n], n0 = n0, path = data.frame(i = keep, est = path[keep]))
+}
+
+## ---------------------------------------------------------------- asymptotic variance (Theorem 4.8)
+#' Plug-in sigma^2 = Var((gamma'(X) - gamma'(Q))_+) / ((1-p)^2 gamma''(SQ)^2).
+sigma2_hat <- function(x, p, gen, est = sq_emp(x, p, gen)) {
+  z <- pmax(gen$g1(x) - gen$g1(est$Q), 0); var(z) / ((1 - p)^2 * gen$g2(est$SQ)^2)
+}
+
+## ---------------------------------------------------------------- tail index: Hill, QQ (Kratz-Resnick), GPD
+hill <- function(x, k) { xs <- sort(x[x > 0], decreasing = TRUE); mean(log(xs[1:k])) - log(xs[k + 1]) }
+#' QQ-estimator of Kratz & Resnick (1996): least-squares slope of the Pareto QQ-plot
+#' (-log(i/(k+1)), log X_(n-i+1)), i = 1..k, an estimator of xi = 1/alpha.
+qq_xi <- function(x, k) {
+  xs <- sort(x[x > 0], decreasing = TRUE)[1:k]; u <- -log(seq_len(k) / (k + 1))
+  sum((u - mean(u)) * (log(xs) - mean(log(xs)))) / sum((u - mean(u))^2)
+}
+gpd_fit <- function(y) {                                   # excesses y > 0
+  nll <- function(par) { xi <- par[1]; sg <- exp(par[2]); if (abs(xi) < 1e-8) xi <- 1e-8
+    z <- 1 + xi * y / sg; if (any(z <= 0)) return(1e10); length(y) * log(sg) + (1 / xi + 1) * sum(log(z)) }
+  best <- NULL
+  for (s0 in list(c(0.1, log(mean(y))), c(0.5, log(median(y))), c(0.3, log(sd(y))))) {
+    o <- tryCatch(optim(s0, nll, control = list(maxit = 5000, reltol = 1e-12)), error = function(e) NULL)
+    if (!is.null(o) && (is.null(best) || o$value < best$value)) best <- o
+  }
+  c(xi = best$par[1], sigma = exp(best$par[2]))
+}
+#' POT-GPD CVaR at level p (threshold u = Q_pu, p > pu), finite if xi < 1.
+pot_cvar <- function(x, p, pu = 0.90) {
+  u <- quantile(x, pu, type = 1, names = FALSE); y <- x[x > u] - u; th <- gpd_fit(y); zeta <- length(y) / length(x)
+  q <- u + th[["sigma"]] / th[["xi"]] * (((1 - p) / zeta)^(-th[["xi"]]) - 1)
+  c(xi = th[["xi"]], sigma = th[["sigma"]], q = q,
+    cvar = if (th[["xi"]] < 1) (q + th[["sigma"]] - th[["xi"]] * u) / (1 - th[["xi"]]) else Inf)
+}
+
+## ---------------------------------------------------------------- intervals
+#' Basic bootstrap interval from resampling a statistic stat(x) (n-out-of-n or m-out-of-n).
+#' With subsample size m and normalising rate a_k = k^r:  a_n (theta_hat - theta) ~ a_m (theta*_m - theta_hat).
+boot_ci <- function(x, stat, m = length(x), rate = 0.5, B = 1000, level = 0.95) {
+  n <- length(x); th <- stat(x)
+  bs <- vapply(seq_len(B), function(b) stat(sample(x, m, replace = TRUE)), numeric(1))
+  d <- quantile(bs - th, c((1 + level) / 2, (1 - level) / 2), na.rm = TRUE, names = FALSE)
+  c(lo = th - (m / n)^rate * d[1], hi = th - (m / n)^rate * d[2])
+}
+wald_ci <- function(x, p, gen, level = 0.95) {
+  e <- sq_emp(x, p, gen); se <- sqrt(sigma2_hat(x, p, gen, e) / length(x)); z <- qnorm((1 + level) / 2)
+  c(lo = e$SQ - z * se, hi = e$SQ + z * se)
+}
+#' Parametric bootstrap interval for the POT-GPD CVaR (the GPD is refitted on each sample).
+pot_ci <- function(x, p, pu = 0.90, B = 500, level = 0.95) {
+  fit <- pot_cvar(x, p, pu); u <- quantile(x, pu, type = 1, names = FALSE); n <- length(x)
+  body <- x[x <= u]; k <- sum(x > u)
+  bs <- vapply(seq_len(B), function(b) {
+    nk <- rbinom(1, n, k / n)
+    yk <- fit[["sigma"]] / fit[["xi"]] * (runif(nk)^(-fit[["xi"]]) - 1)
+    pot_cvar(c(sample(body, n - nk, replace = TRUE), u + yk), p, pu)[["cvar"]]
+  }, numeric(1))
+  q <- quantile(bs[is.finite(bs)], c((1 - level) / 2, (1 + level) / 2), names = FALSE)
+  c(est = fit[["cvar"]], lo = q[1], hi = q[2])
+}
+
+## ---------------------------------------------------------------- output helpers
+fmt <- function(v, d) ifelse(is.finite(v), formatC(v, format = "f", digits = d), "--")
+fmt_ci <- function(ci, d) if (all(is.finite(ci))) sprintf("[%s, %s]", fmt(ci[1], d), fmt(ci[2], d)) else "--"
+fmt_p <- function(v) ifelse(!is.finite(v), "--", ifelse(v < 0.001, "$<0.001$", formatC(v, format = "f", digits = 3)))
+write_tex <- function(lines, name) writeLines(lines, file.path(OUT, "tables", paste0(name, ".tex")))
+save_fig <- function(pl, name, w = 12, h = 7) {
+  print(pl); ggsave(file.path(OUT, "figures", paste0(name, ".pdf")), pl, width = w, height = h,
+                    device = if (capabilities("cairo")) cairo_pdf else "pdf")
+}
+theme_article <- function(base = 14) theme_bw(base_size = base) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"), panel.grid.minor = element_blank())
+```
+
+# Data
+
+```{r data}
+load_danish <- function() {
+  if (nzchar(params$danish_csv)) return(as.numeric(read.csv(params$danish_csv)[[1]]))
+  if (!requireNamespace("evir", quietly = TRUE)) install.packages("evir")
+  utils::data("danish", package = "evir", envir = environment())
+  tm <- attr(danish, "times"); x <- as.numeric(danish)
+  if (!is.null(tm)) x <- x[order(tm)]                      # chronological order for the recursion
+  x
+}
+load_sp <- function() {
+  if (nzchar(params$sp_csv)) { d <- read.csv(params$sp_csv); d <- d[order(as.Date(d$date)), ]
+    return(list(x = -diff(log(d$close)), from = min(d$date), to = max(d$date))) }
+  if (!requireNamespace("quantmod", quietly = TRUE)) install.packages("quantmod")
+  px <- quantmod::getSymbols("^GSPC", src = "yahoo", from = params$sp_from, to = params$sp_to, auto.assign = FALSE)
+  cl <- as.numeric(quantmod::Cl(px)); x <- -diff(log(cl)); ok <- is.finite(x)
+  list(x = x[ok], from = format(min(zoo::index(px))), to = format(max(zoo::index(px))))
+}
+load_boeing <- function() {
+  if (nzchar(params$boeing_csv)) { d <- read.csv(params$boeing_csv); d <- d[order(as.Date(d$date)), ]
+    return(list(x = -diff(log(d$close)), from = min(d$date), to = max(d$date))) }
+  if (!requireNamespace("quantmod", quietly = TRUE)) install.packages("quantmod")
+  px <- quantmod::getSymbols("BA", src = "yahoo", from = params$boeing_from, to = params$boeing_to, auto.assign = FALSE)
+  cl <- as.numeric(quantmod::Cl(px)); x <- -diff(log(cl)); ok <- is.finite(x)
+  list(x = x[ok], from = format(min(zoo::index(px))), to = format(max(zoo::index(px))))
+}
+x_dan <- load_danish()
+SP <- load_sp(); x_sp <- SP$x
+BA <- load_boeing(); x_ba <- BA$x
+cat(sprintf("Danish: n = %d.  S&P 500: n = %d daily log-losses, %s to %s.  Boeing: n = %d daily log-losses, %s to %s.\n",
+            length(x_dan), length(x_sp), SP$from, SP$to, length(x_ba), BA$from, BA$to))
+DATA <- list(`Danish fire losses` = x_dan, `S&P 500 daily log-losses` = x_sp, `Boeing daily log-losses` = x_ba)
+```
+
+# Superquantile estimates and confidence intervals
+
+For each level $p$ and each functional (CVaR; $\asinh$ with $s=\mathrm{IQR}/1.349$):
+
+* **Point estimates.** Empirical, kernel, recursive indicator, recursive kernel (Newton gains, steps $1/n$),
+  recursive with steps $n^{-0.8}$ and Polyak–Ruppert averaging; recursive estimators in chronological order.
+* **Regime.** $\Var\gamma'(X)<\infty$ always holds for the $\asinh$ generator; for the CVaR it requires $\xi<1/2$
+  ($\xi$ estimated by POT–GPD maximum likelihood). Wald and $n$-out-of-$n$ intervals are given only in the regular regime.
+* **Bootstrap.** $m$-out-of-$n$ basic bootstrap with $m=$ `m_frac`$\cdot n$ and rate $a_k=k^{1/2}$ (regular) or
+  $a_k=k^{1-\widehat\xi}$ (CVaR with $\widehat\xi\in(1/2,1)$); intervals only if $m(1-p)\ge$ `min_exceed`.
+
+```{r core}
+EST <- c(empirical = "Empirical", kernel = "Kernel", rec_ind = "Rec. indicator",
+         rec_ker = "Rec. kernel", rec_pr = "Rec. PR")
+#' xi_regime: tail index used to decide the regime (default: POT-GPD estimate; for the stable model, 1/alpha).
+analyse <- function(x, p_levels, label, pu = 0.90, xi_regime = NULL) {
+  n <- length(x); s_iqr <- robust_scale(x); h_ker <- s_iqr * n^(-params$a_ker)
+  u <- quantile(x, pu, type = 1, names = FALSE); pot <- gpd_fit(x[x > u] - u)
+  xi <- if (is.null(xi_regime)) pot[["xi"]] else xi_regime; m <- floor(params$m_frac * n)
+  funs <- list(
+    list(key = "cvar",  lab = "CVaR", gen = make_gen("quad"),
+         rate_m = if (xi < 0.5) 0.5 else if (xi < 1) 1 - xi else NA, regular = xi < 0.5),
+    list(key = "asinh", lab = "asinh-Bregman", gen = make_gen("asinh", s_iqr), rate_m = 0.5, regular = TRUE))
+  rows <- list(); recs <- list()
+  for (p in p_levels) for (F in funs) {
+    g <- F$gen; stat <- function(z) sq_emp(z, p, g)$SQ
+    e  <- sq_emp(x, p, g)$SQ
+    k  <- sq_kernel(x, p, g, h_ker)$SQ
+    ri <- sq_recursive(x, p, g, "newton", "indicator")
+    rk <- sq_recursive(x, p, g, "newton", "kernel")
+    rp <- sq_recursive(x, p, g, "pr", "kernel")
+    ok_n <- n * (1 - p) >= params$min_exceed; ok_m <- m * (1 - p) >= params$min_exceed
+    w  <- if (F$regular && ok_n) wald_ci(x, p, g) else c(NA, NA)
+    bn <- if (F$regular && ok_n) boot_ci(x, stat, n, 0.5, B) else c(NA, NA)
+    bm <- if (is.finite(F$rate_m) && ok_m) boot_ci(x, stat, m, F$rate_m, B) else c(NA, NA)
+    rows[[length(rows) + 1]] <- data.frame(data = label, p = p, functional = F$lab, key = F$key,
+      empirical = e, kernel = k, rec_ind = ri$SQ, rec_ker = rk$SQ, rec_pr = rp$SQ,
+      wald_lo = w[1], wald_hi = w[2], boot_lo = bn[1], boot_hi = bn[2], mboot_lo = bm[1], mboot_hi = bm[2],
+      stringsAsFactors = FALSE)
+    recs[[length(recs) + 1]] <- cbind(rbind(data.frame(ri$path, method = "Rec. indicator"),
+                                            data.frame(rk$path, method = "Rec. kernel"),
+                                            data.frame(rp$path, method = "Rec. PR")),
+                                      p = p, functional = F$lab, batch = e)
+  }
+  list(tab = do.call(rbind, rows), rec = do.call(rbind, recs), xi = xi, s_iqr = s_iqr, m = m, n = n)
+}
+P_DAN <- c(0.95, 0.99, 0.995)
+P_SP  <- c(0.50, 0.75, 0.90, 0.95, 0.975, 0.99, 0.995, 0.999)
+t0 <- proc.time()[["elapsed"]]
+RES_dan <- analyse(x_dan, P_DAN, "Danish")
+RES_sp  <- analyse(x_sp,  P_SP,  "S&P 500")
+cat(sprintf("Elapsed: %.1f min\n", (proc.time()[["elapsed"]] - t0) / 60))
+cat(sprintf("Danish: xi_hat (POT) = %.3f, s = IQR/1.349 = %.3f, m = %d.  S&P: xi_hat = %.3f, s = %.5f, m = %d\n",
+            RES_dan$xi, RES_dan$s_iqr, RES_dan$m, RES_sp$xi, RES_sp$s_iqr, RES_sp$m))
+kable(RES_dan$tab[, -4], digits = 3, caption = "Danish fire losses")
+kable(RES_sp$tab[, -4], digits = 5, caption = "S&P 500 daily log-losses")
+```
+
+## POT–GPD CVaR with parametric-bootstrap intervals
+
+```{r pot}
+pot_table <- function(x, P) { M <- t(vapply(P, function(p) pot_ci(x, p, B = min(B, 1000)), numeric(3)))
+  rownames(M) <- formatC(P, format = "g"); M }
+POT_dan <- pot_table(x_dan, P_DAN)
+POT_sp  <- pot_table(x_sp, P_SP[P_SP > 0.90])
+kable(POT_dan, digits = 2, caption = "Danish: POT-GPD CVaR and 95% parametric-bootstrap interval")
+kable(POT_sp, digits = 5, caption = "S&P 500: POT-GPD CVaR and 95% parametric-bootstrap interval")
+```
+
+## Recursive trajectories (chronological order)
+
+```{r traj, fig.width = 14, fig.height = 9}
+plot_traj <- function(R, name, title) {
+  d <- R$rec; d$pl <- factor(sprintf("p = %s", formatC(d$p, format = "g")), levels = sprintf("p = %s", formatC(sort(unique(d$p)), format = "g")))
+  d$functional <- factor(d$functional, levels = c("CVaR", "asinh-Bregman"))
+  d$method <- factor(d$method, levels = c("Rec. indicator", "Rec. kernel", "Rec. PR"))
+  b <- unique(d[, c("pl", "functional", "batch")])
+  pl <- ggplot(d, aes(i, est, colour = method)) + geom_line(linewidth = 0.7) +
+    geom_hline(data = b, aes(yintercept = batch), linetype = 2, colour = "grey30") +
+    facet_grid(functional ~ pl, scales = "free_y") +
+    scale_colour_manual(values = c("#E69F00", "#0072B2", "#CC79A7")) +
+    labs(x = "number of observations (chronological order)", y = "recursive estimate", colour = NULL,
+         title = title,
+         subtitle = sprintf("Dashed: full-sample empirical estimate. Newton gains from the warm start; h_n = s_hat n^-%g; PR: steps n^-%g", params$a_rec, params$rho_pr)) +
+    theme_article(12)
+  save_fig(pl, name, 14, 9)
+}
+plot_traj(RES_dan, "fig_danish_recursive", "Danish fire losses: recursive estimates")
+RES_sp_sub <- RES_sp; RES_sp_sub$rec <- subset(RES_sp$rec, p %in% c(0.95, 0.99, 0.995))
+plot_traj(RES_sp_sub, "fig_sp_recursive", "S&P 500 daily log-losses: recursive estimates")
+```
+
+
+# The stable model
+
+The stable law is fitted to the Boeing losses only (the Danish and S&P 500 losses are modelled by the GPD).
+
+## Stable fit and parametric-bootstrap KS / CvM / AD tests
+
+Minimum-distance fit on the empirical characteristic function, $S(\alpha,\beta,\gamma,\delta;0)$; the parameters are
+re-estimated on each parametric-bootstrap sample.
+
+```{r stable-fit}
+stable_cf <- function(t, alpha, beta, gamma, delta) {     # t > 0, S0 parameterisation
+  if (abs(alpha - 1) < 1e-4) alpha <- 1 + 1e-4
+  exp(-gamma^alpha * t^alpha * (1 + 1i * beta * tan(pi * alpha / 2) * ((gamma * t)^(1 - alpha) - 1)) + 1i * delta * t)
+}
+fit_stable_ecf <- function(x, t_grid = seq(0.1, 3, length.out = 60)) {
+  m <- median(x); s <- robust_scale(x); z <- (x - m) / s
+  phi_n <- sapply(t_grid, function(t) mean(exp(1i * t * z)))
+  w <- exp(-t_grid / 2); w <- w / sum(w)
+  obj <- function(par) {
+    if (par[1] <= 0.5 || par[1] > 2 || abs(par[2]) > 1 || par[3] <= 0) return(1e10)
+    sum(w * Mod(phi_n - stable_cf(t_grid, par[1], par[2], par[3], par[4]))^2)
+  }
+  starts <- expand.grid(a = c(1.2, 1.5, 1.8), b = c(0, 0.9)); best <- NULL
+  for (k in seq_len(nrow(starts))) {
+    fit <- tryCatch(optim(c(starts$a[k], starts$b[k], 1, 0), obj, method = "L-BFGS-B",
+                          lower = c(0.51, -1, 1e-3, -50), upper = c(2, 1, 50, 50)), error = function(e) NULL)
+    if (!is.null(fit) && (is.null(best) || fit$value < best$value)) best <- fit
+  }
+  q <- best$par
+  c(alpha = q[1], beta = q[2], gamma = s * q[3], delta = m + s * q[4])
+}
+rstable_par <- function(n, par) stabledist::rstable(n, alpha = par[["alpha"]], beta = par[["beta"]],
+                                                     gamma = par[["gamma"]], delta = par[["delta"]], pm = 0)
+gof_stats <- function(z) {
+  z <- sort(pmin(pmax(z, 1e-12), 1 - 1e-12)); N <- length(z); i <- seq_len(N)
+  c(KS  = max(i / N - z, z - (i - 1) / N),
+    CvM = 1 / (12 * N) + sum((z - (2 * i - 1) / (2 * N))^2),
+    AD  = -N - mean((2 * i - 1) * (log(z) + log(1 - rev(z)))))
+}
+stable_cdf_fast <- function(xv, par, ngrid = 250) {
+  sx <- sort(xv)
+  g <- sort(unique(c(as.numeric(quantile(sx, seq(0, 1, length.out = ngrid))), head(sx, 10), tail(sx, 40))))
+  cdf <- stabledist::pstable(g, alpha = par[["alpha"]], beta = par[["beta"]],
+                             gamma = par[["gamma"]], delta = par[["delta"]], pm = 0)
+  approx(g, cdf, xout = xv, rule = 2)$y
+}
+stable_gof <- function(x, B) {
+  par <- fit_stable_ecf(x); obs <- gof_stats(stable_cdf_fast(x, par))
+  sims <- t(vapply(seq_len(B), function(b) {
+    xs <- rstable_par(length(x), par)
+    ps <- tryCatch(fit_stable_ecf(xs), error = function(e) NULL)
+    if (is.null(ps)) rep(NA_real_, 3) else gof_stats(stable_cdf_fast(xs, ps)) }, numeric(3)))
+  list(par = par, stat = obs, p = (1 + colSums(sweep(sims, 2, obs, ">="), na.rm = TRUE)) / (1 + colSums(!is.na(sims))))
+}
+SDATA <- DATA["Boeing daily log-losses"]   # the stable law is fitted to the Boeing losses only
+GOF <- lapply(SDATA, stable_gof, B = B_gof)
+kable(t(sapply(GOF, function(g) c(g$par, g$stat, p = g$p))), digits = 4,
+      caption = "Stable fit (S0), KS/CvM/AD statistics and parametric-bootstrap p-values")
+```
+
+## QCV tests (Pitera, Chechkin & Wyłomańska, 2022) and exact Monte Carlo confidence sets
+
+The sample quantile conditional variance $\widehat\sigma^2(a,b)$ is the variance of the order statistics
+$X_{([na]+1)},\dots,X_{([nb])}$. The test statistic
+$$N=\sqrt n\,\frac{d_1\widehat\sigma^2(a_1,a_2)+d_2\widehat\sigma^2(a_2,a_3)+d_3\widehat\sigma^2(a_3,a_4)}{\widehat\sigma^2(a_1,a_4)}$$
+is invariant to location and scale. Designs of the paper: $N_1$ with $(a_1,a_2)=(0.05,0.25)$, $N_2$ with
+$(0.005,0.25)$, $N_3$ with $(0.005,0.04)$, $a_3=1-a_2$, $a_4=1-a_1$.
+
+* Under $H_0:X\sim S(\alpha_0,\beta_0,\gamma,\delta)$ the law of $N$ depends only on $(\alpha_0,\beta_0)$: the Monte
+  Carlo test with $B_{mc}$ replications is **exact** (Dufour, 2006). Two-sided $p$-value $2\min(\hat q_-,\hat q_+)$.
+* Inverting the three tests on a grid of $(\alpha_0,\beta_0)$ with a Bonferroni correction gives a confidence set of
+  level at least $95\%$ (Beaulieu, Dufour & Khalaf, 2014); an **empty set** rejects the stable family at level $5\%$.
+* Chambers–Mallows–Stuck simulation with common random numbers across the grid ($S_1$ parameterisation: a change of
+  location does not change $N$).
+
+```{r qcv}
+QCV_DESIGNS <- list(N1 = list(a = c(0.05,  0.25, 0.75, 0.95),  d = c(1.00, -1.01, 1.00)),
+                    N2 = list(a = c(0.005, 0.25, 0.75, 0.995), d = c(0.60, -1.61, 0.60)),
+                    N3 = list(a = c(0.005, 0.04, 0.96, 0.995), d = c(1.15, -0.17, 1.15)))
+qcv_sorted <- function(xs, a, b) { n <- length(xs); v <- xs[(floor(n * a) + 1):floor(n * b)]; mean((v - mean(v))^2) }
+qcv_N <- function(x, sorted = FALSE) {
+  xs <- if (sorted) x else sort(x); n <- length(xs)
+  vapply(QCV_DESIGNS, function(D) { a <- D$a
+    sqrt(n) * (D$d[1] * qcv_sorted(xs, a[1], a[2]) + D$d[2] * qcv_sorted(xs, a[2], a[3]) +
+               D$d[3] * qcv_sorted(xs, a[3], a[4])) / qcv_sorted(xs, a[1], a[4]) }, numeric(1))
+}
+#' Chambers-Mallows-Stuck, S(alpha, beta, 1, 0; 1), from V ~ U(-pi/2, pi/2) and W ~ Exp(1) (matrices).
+cms_s1 <- function(alpha, beta, V, W) {
+  if (abs(alpha - 1) < 1e-8)
+    return((2 / pi) * ((pi / 2 + beta * V) * tan(V) - beta * log((pi / 2) * W * cos(V) / (pi / 2 + beta * V))))
+  Bab <- atan(beta * tan(pi * alpha / 2)) / alpha; Sab <- (1 + beta^2 * tan(pi * alpha / 2)^2)^(1 / (2 * alpha))
+  Sab * sin(alpha * (V + Bab)) / cos(V)^(1 / alpha) * (cos(V - alpha * (V + Bab)) / W)^((1 - alpha) / alpha)
+}
+qcv_null <- function(alpha, beta, V, W) t(apply(cms_s1(alpha, beta, V, W), 2, function(z) qcv_N(sort(z), sorted = TRUE)))
+qcv_pvalues <- function(N0, Ns) {
+  lo <- (1 + colSums(sweep(Ns, 2, N0, "<="))) / (nrow(Ns) + 1)
+  hi <- (1 + colSums(sweep(Ns, 2, N0, ">="))) / (nrow(Ns) + 1)
+  pmin(1, 2 * pmin(lo, hi))
+}
+qcv_analysis <- function(x, fit, label) {
+  n <- length(x); N0 <- qcv_N(x)
+  V <- matrix(runif(n * B_mc, -pi / 2, pi / 2), n, B_mc); W <- matrix(rexp(n * B_mc), n, B_mc)
+  p_fit <- qcv_pvalues(N0, qcv_null(fit[["alpha"]], fit[["beta"]], V, W))
+  grid <- expand.grid(alpha = seq(if (QUICK) 0.6 else 0.5, 2, by = if (QUICK) 0.1 else 0.05),
+                      beta = seq(-1, 1, by = if (QUICK) 0.5 else 0.25))
+  P <- t(vapply(seq_len(nrow(grid)), function(j) qcv_pvalues(N0, qcv_null(grid$alpha[j], grid$beta[j], V, W)),
+                numeric(3)))
+  grid <- cbind(grid, P, pmin = apply(P, 1, min)); grid$accepted <- grid$pmin > 0.05 / 3; grid$data <- label
+  list(N = N0, p_fit = p_fit, grid = grid,
+       alpha_range = if (any(grid$accepted)) range(grid$alpha[grid$accepted]) else c(NA, NA))
+}
+t0 <- proc.time()[["elapsed"]]
+QCV <- Map(qcv_analysis, SDATA, lapply(GOF, `[[`, "par"), names(SDATA))
+cat(sprintf("QCV: %.1f min\n", (proc.time()[["elapsed"]] - t0) / 60))
+kable(t(sapply(QCV, function(q) c(q$N, p = q$p_fit, alpha_lo = q$alpha_range[1], alpha_hi = q$alpha_range[2]))),
+      digits = 3, caption = "QCV statistics, plug-in Monte Carlo p-values at the fitted (alpha, beta), and 95% confidence set for alpha (NA: empty)")
+
+G <- do.call(rbind, lapply(QCV, `[[`, "grid")); G$data <- factor(G$data, levels = names(SDATA))
+pts <- data.frame(data = factor(names(SDATA), levels = names(SDATA)),
+                  alpha = sapply(GOF, function(g) g$par[["alpha"]]), beta = sapply(GOF, function(g) g$par[["beta"]]))
+pl <- ggplot(G, aes(alpha, beta, fill = pmin)) + geom_tile() +
+  geom_point(data = subset(G, accepted), aes(alpha, beta), inherit.aes = FALSE, shape = 4, size = 2) +
+  geom_point(data = pts, aes(alpha, beta), inherit.aes = FALSE, shape = 21, size = 4, fill = "white") +
+  scale_fill_viridis_c(trans = "sqrt", limits = c(0, 1)) + facet_wrap(~ data) +
+  labs(x = expression(alpha[0]), y = expression(beta[0]), fill = "min p-value",
+       title = "Exact QCV Monte Carlo tests of H0: X ~ S(alpha0, beta0, gamma, delta)",
+       subtitle = "Crosses: points of the 95% confidence set (Bonferroni over N1, N2, N3); circle: ECF fit") +
+  theme_article(13)
+save_fig(pl, "fig_stable_qcv", 15, 6)
+```
+
+## Tail index: is $1/\widehat\alpha$ consistent with the tail?
+
+A non-Gaussian stable law has $\xi=1/\alpha>1/2$. For $\alpha$ close to $2$, however, the Pareto regime starts far in
+the tail and the Hill estimator computed at usual $k$ is strongly biased downwards (McCulloch, 1997; Weron, 2001):
+comparing $1/\widehat\alpha$ with $\widehat\xi$ directly is misleading. We therefore compare the estimates of $\xi$ on the
+data (Hill and QQ-estimator of Kratz & Resnick, 1996, at $k=\lfloor\sqrt{n_+}\rfloor$; POT–GPD at $u=Q_{0.90}$) with
+their distribution over `R_tail` samples of the same size simulated from the fitted stable law. A two-sided Monte Carlo
+$p$-value below $0.05$ means that the tail of the data is not the tail of the fitted stable law.
+
+```{r tailindex, fig.width = 15, fig.height = 6}
+hill_curve <- function(x, ks) { ls <- log(sort(x[x > 0], decreasing = TRUE)); cs <- cumsum(ls); cs[ks] / ks - ls[ks + 1] }
+qq_curve <- function(x, ks) { ls <- log(sort(x[x > 0], decreasing = TRUE))
+  vapply(ks, function(k) { u <- -log(seq_len(k) / (k + 1)); y <- ls[1:k]
+    sum((u - mean(u)) * (y - mean(y))) / sum((u - mean(u))^2) }, 1) }
+xi_three <- function(x) {
+  k <- floor(sqrt(sum(x > 0))); u <- quantile(x, 0.90, type = 1, names = FALSE)
+  c(hill = hill(x[x > 0], k), qq = qq_xi(x, k), gpd = gpd_fit(x[x > u] - u)[["xi"]])
+}
+tail_calibration <- function(x, par, label) {
+  ks <- seq(10, min(floor(sum(x > 0) / 4), 600), by = 5)
+  sims <- replicate(R_tail, { xs <- rstable_par(length(x), par)
+    list(xi = xi_three(xs), hill = hill_curve(xs, ks), qq = qq_curve(xs, ks)) }, simplify = FALSE)
+  XI <- t(sapply(sims, `[[`, "xi")); obs <- xi_three(x)
+  pv <- sapply(names(obs), function(j) min(1, 2 * min((1 + sum(XI[, j] <= obs[[j]])) / (R_tail + 1),
+                                                      (1 + sum(XI[, j] >= obs[[j]])) / (R_tail + 1))))
+  band <- function(M) t(apply(M, 2, quantile, c(0.025, 0.5, 0.975), na.rm = TRUE))
+  bh <- band(do.call(rbind, lapply(sims, `[[`, "hill"))); bq <- band(do.call(rbind, lapply(sims, `[[`, "qq")))
+  curves <- rbind(data.frame(data = label, k = ks, est = hill_curve(x, ks), lo = bh[, 1], med = bh[, 2], hi = bh[, 3], method = "Hill"),
+                  data.frame(data = label, k = ks, est = qq_curve(x, ks), lo = bq[, 1], med = bq[, 2], hi = bq[, 3], method = "QQ-estimator"))
+  list(obs = obs, sim_lo = apply(XI, 2, quantile, 0.025), sim_hi = apply(XI, 2, quantile, 0.975), p = pv,
+       inv_alpha = 1 / par[["alpha"]], curves = curves)
+}
+TAILC <- Map(tail_calibration, SDATA, lapply(GOF, `[[`, "par"), names(SDATA))
+kable(t(sapply(TAILC, function(T) c(inv_alpha = T$inv_alpha, T$obs, p = T$p))), digits = 3,
+      caption = "1/alpha_hat, estimates of xi on the data and Monte Carlo p-values under the fitted stable law")
+CU <- do.call(rbind, lapply(TAILC, `[[`, "curves")); CU$data <- factor(CU$data, levels = names(SDATA))
+ref <- data.frame(data = factor(names(SDATA), levels = names(SDATA)), inv_alpha = sapply(TAILC, `[[`, "inv_alpha"))
+pl <- ggplot(CU, aes(k)) + geom_ribbon(aes(ymin = lo, ymax = hi, fill = method), alpha = 0.2) +
+  geom_line(aes(y = est, colour = method), linewidth = 0.9) +
+  geom_hline(data = ref, aes(yintercept = inv_alpha), linetype = 2) + geom_hline(yintercept = 0.5, colour = "grey50") +
+  facet_wrap(~ data, scales = "free") +
+  scale_colour_manual(values = c("#0072B2", "#D55E00")) + scale_fill_manual(values = c("#0072B2", "#D55E00")) +
+  labs(x = "number k of upper order statistics", y = "estimate of xi", colour = NULL, fill = NULL,
+       title = "Tail index of the data against the fitted stable law",
+       subtitle = "Lines: data; bands: 95% range of the same estimator on samples from the fitted stable law; dashed: 1/alpha_hat; grey: xi = 1/2") +
+  theme_article(13)
+save_fig(pl, "fig_tail_index", 15, 6)
+```
+
+## Aggregation diagnostic (Burnecki, Wyłomańska & Chechkin, 2015)
+
+Block sums of $K$ consecutive observations of an $\alpha$-stable sample are $\alpha$-stable; for data in the Gaussian domain
+of attraction $\widehat\alpha_K$ drifts towards $2$. Graphical diagnostic, not a formal test.
+
+```{r aggregation, fig.width = 15, fig.height = 6}
+aggregate_alpha <- function(x, label, Kmax = 10) {
+  do.call(rbind, lapply(seq_len(Kmax), function(K) {
+    nb <- floor(length(x) / K); S <- colSums(matrix(x[seq_len(nb * K)], nrow = K))
+    a0 <- fit_stable_ecf(S)[["alpha"]]
+    ab <- vapply(seq_len(B_agg), function(b) fit_stable_ecf(sample(S, nb, replace = TRUE))[["alpha"]], 1)
+    data.frame(data = label, K = K, alpha = c(a0, ab), type = c("estimate", rep("bootstrap", B_agg)))
+  }))
+}
+AGG <- do.call(rbind, Map(aggregate_alpha, SDATA, names(SDATA))); AGG$data <- factor(AGG$data, levels = names(SDATA))
+pl <- ggplot(subset(AGG, type == "bootstrap"), aes(factor(K), alpha)) + geom_boxplot(outlier.size = 0.6, fill = "grey90") +
+  geom_point(data = subset(AGG, type == "estimate"), colour = "#D55E00", size = 3) +
+  geom_hline(yintercept = 2, linetype = 2) + facet_wrap(~ data) +
+  labs(x = "aggregation level K (sums of K consecutive observations)", y = expression(hat(alpha)[K]),
+       title = "Stability index of aggregated data", subtitle = "Red: estimate on the aggregated sample; boxes: bootstrap") +
+  theme_article(13)
+save_fig(pl, "fig_stable_aggregation", 15, 6)
+AGG_SUM <- with(subset(AGG, type == "estimate"), tapply(alpha, list(as.character(data), K), identity))
+kable(AGG_SUM, digits = 3, caption = "alpha_K fitted to the aggregated samples")
+```
+
+## Cross-check with the package MixStable
+
+```{r mixstable}
+MIX <- NULL
+if (HAS_MIXSTABLE) {
+  mix_one <- function(x) {
+    mle <- tryCatch(unlist(MixStable::robust_mle_estimate(x)), error = function(e) NULL)
+    qcv <- tryCatch(as.numeric(MixStable::qcv_stat(x))[1], error = function(e) NA_real_)
+    c(alpha_mle = if (!is.null(mle) && "alpha" %in% names(mle)) mle[["alpha"]] else NA_real_,
+      beta_mle  = if (!is.null(mle) && "beta"  %in% names(mle)) mle[["beta"]]  else NA_real_,
+      qcv_stat = qcv)
+  }
+  MIX <- t(sapply(SDATA, mix_one))
+  print(kable(MIX, digits = 3, caption = "MixStable: robust maximum likelihood estimate and QCV statistic"))
+} else cat("Package MixStable not installed: cross-check skipped (install.packages('MixStable')).\n")
+```
+
+## Boeing losses: superquantiles under the stable model
+
+For the Boeing losses the regime is decided by the fitted stable law: $\xi=1/\widehat\alpha$. The superquantiles
+implied by the fitted law are computed from the representation of Theorem 6.1,
+$\mathrm{CVaR}_p=Q_p+\frac1{1-p}\int_{Q_p}^\infty\Prob(X>t)\,dt$, and, for the $\asinh$ generator, by integration by parts,
+$\E[\asinh(X/s)\mid X\ge Q_p]=\asinh(Q_p/s)+\frac1{1-p}\int_{Q_p}^\infty\frac{\Prob(X>t)}{\sqrt{s^2+t^2}}\,dt$.
+
+```{r boeing, fig.width = 14, fig.height = 9}
+PAR_ba <- GOF$`Boeing daily log-losses`$par
+stable_sq_model <- function(p, par, s) {
+  sf <- function(t) stabledist::pstable(t, alpha = par[["alpha"]], beta = par[["beta"]], gamma = par[["gamma"]],
+                                        delta = par[["delta"]], pm = 0, lower.tail = FALSE)
+  Q <- stabledist::qstable(p, alpha = par[["alpha"]], beta = par[["beta"]], gamma = par[["gamma"]],
+                           delta = par[["delta"]], pm = 0)
+  I1 <- tryCatch(integrate(sf, Q, Inf, rel.tol = 1e-8, subdivisions = 1000L)$value, error = function(e) NA_real_)
+  I2 <- tryCatch(integrate(function(t) sf(t) / sqrt(s^2 + t^2), Q, Inf, rel.tol = 1e-8, subdivisions = 1000L)$value,
+                 error = function(e) NA_real_)
+  c(Q = Q, cvar = if (par[["alpha"]] > 1) Q + I1 / (1 - p) else Inf, asinh = s * sinh(asinh(Q / s) + I2 / (1 - p)))
+}
+P_BA <- c(0.95, 0.99, 0.995)
+RES_ba <- analyse(x_ba, P_BA, "Boeing", xi_regime = 1 / PAR_ba[["alpha"]])
+MOD_ba <- t(vapply(P_BA, stable_sq_model, numeric(3), par = PAR_ba, s = RES_ba$s_iqr)); rownames(MOD_ba) <- formatC(P_BA, format = "g")
+kable(RES_ba$tab[, -4], digits = 5, caption = "Boeing daily log-losses: nonparametric estimates and intervals")
+kable(MOD_ba, digits = 5, caption = "Boeing: quantile, CVaR and asinh-Bregman superquantile of the fitted stable law")
+plot_traj(RES_ba, "fig_boeing_recursive", "Boeing daily log-losses: recursive estimates")
+```
+
+## Boeing losses: stable parameters from Bregman superquantiles (Section 6)
+
+The functions below are those of the companion notebook `stable_parameters_superquantiles.Rmd`. For
+$X\sim S_0(\alpha,\beta,\gamma,\zeta)$, $1<\alpha\le2$, Theorem 6.1 gives $H(Q;\theta)=\E_\theta[(X-Q)^+]$ through Nolan's
+integral $g_{-1}$, and the quadratic superquantile satisfies exactly $T_p=Q_p+H(Q_p;\theta)/(1-p)$. The parameters
+minimise $J(\theta)=\sum_i[(\widehat T_{p_i}-T_\theta(\widehat Q_{p_i}))/(1+|\widehat T_{p_i}|)]^2$ over the levels
+$p\in\{0.25,0.5,0.75,0.95\}$ of both tails, with the five superquantile estimators, on the data standardised by the
+median and IQR/1.349. The ECF fit is the benchmark. The model-implied CVaR of the next table uses the same
+representation, $\mathrm{CVaR}_p=Q_p+H(Q_p;\widehat\theta)/(1-p)$.
+
+```{r boeing-sqfit}
+make_generator <- function(name, s = 1, a = 0.5) {
+  switch(name,
+    quad = list(name = "quad", label = "Quadratic (exact)",
+                g1 = function(x) x, g2 = function(x) rep(1, length(x)), ginv = function(y) y),
+    asinh = list(name = "asinh", label = "asinh (linearised)",
+                 g1 = function(x) asinh(x / s), g2 = function(x) 1 / (s * sqrt(1 + (x / s)^2)),
+                 ginv = function(y) s * sinh(y)),
+    sin = list(name = "sin", label = "x + a cos x (linearised)",
+               g1 = function(x) x + a * cos(x), g2 = function(x) 1 - a * sin(x),
+               ginv = function(y) { x <- y; for (k in 1:60) x <- x - (x + a * cos(x) - y) / (1 - a * sin(x)); x }),
+    stop("Unknown generator: ", name))
+}
+GENS <- list(quad = make_generator("quad"), asinh = make_generator("asinh"), sin = make_generator("sin"))
+gen_lab <- vapply(GENS, `[[`, "", "label")
+
+gauss_legendre <- function(m) {
+  i <- seq_len(m - 1); b <- i / sqrt(4 * i^2 - 1)
+  J <- matrix(0, m, m); J[cbind(i, i + 1)] <- b; J[cbind(i + 1, i)] <- b
+  e <- eigen(J, symmetric = TRUE); o <- order(e$values)
+  list(x = e$values[o], w = 2 * e$vectors[1, o]^2)
+}
+.GL20 <- gauss_legendre(20); .GL40 <- gauss_legendre(40)
+
+#' g_{-1}(x | alpha, beta): composite Gauss-Legendre in r on [0, 34^(1/alpha)] (exp(-r^alpha) < 1e-14 beyond).
+#' The form -2 sin^2(u/2) = cos(u) - 1 avoids cancellation near r = 0.
+g_m1 <- function(x, alpha, beta) {
+  tn <- tan(pi * alpha / 2); R <- 34^(1 / alpha)
+  phase <- max(abs(x)) * R + abs(beta * tn) * R^alpha
+  npan <- min(400, max(8, ceiling(phase / 12)))
+  edges <- seq(0, R, length.out = npan + 1); a <- edges[-length(edges)]; b <- edges[-1]
+  half <- (b - a) / 2; mid <- (a + b) / 2
+  r <- as.vector(outer(.GL20$x, half) + matrix(mid, 20, npan, byrow = TRUE))
+  w <- as.vector(outer(.GL20$w, half)); er <- exp(-r^alpha) / r^2; rA <- r^alpha
+  vapply(x, function(xi) sum(w * (-2 * sin((xi * r - beta * tn * rA) / 2)^2) * er), numeric(1))
+}
+#' Theorem 6.1: E[(X - Q)^+], X ~ S0(alpha, beta, gam, zeta), alpha > 1 (vectorised in Q).
+H_stable <- function(Q, alpha, beta, gam = 1, zeta = 0) {
+  tn <- tan(pi * alpha / 2); z <- (Q - zeta + beta * gam * tn) / gam
+  0.5 * (zeta - beta * gam * tn - Q) + (gam / pi) * (base::gamma(1 - 1 / alpha) - g_m1(z, alpha, beta))
+}
+#' Model statistic T_theta(Q) = gamma'(Q) + gamma''(Q) H(Q; theta) / (1 - p)  (exact for quad).
+T_model <- function(Q, alpha, beta, gam, zeta, gen, p)
+  gen$g1(Q) + gen$g2(Q) * H_stable(Q, alpha, beta, gam, zeta) / (1 - p)
+n0_rule <- function(p) as.integer(max(200, ceiling(20 / (1 - p))))
+
+est_emp <- function(x, P, gen) {
+  xs <- sort(x); n <- length(xs); G <- cumsum(rev(gen$g1(xs)))      # G[j] = sum of the j largest g1(x)
+  t(vapply(P, function(p) {
+    k <- ceiling(n * p - 1e-9); q <- xs[k]; up <- if (k < n) G[n - k] else 0
+    c(Q = q, T = ((k - n * p) * gen$g1(q) + up) / (n * (1 - p)))
+  }, numeric(2)))
+}
+kernel_quantile <- function(x, p, h, start) {
+  t <- start
+  for (it in 1:30) {
+    z <- (t - x) / h; Fv <- mean(pnorm(z)) - p; dv <- mean(dnorm(z)) / h
+    if (!is.finite(dv) || dv < 1e-12) break
+    st <- Fv / dv; t <- t - st
+    if (abs(st) < 1e-10 * (1 + abs(t))) return(t)
+  }
+  tryCatch(uniroot(function(t) mean(pnorm((t - x) / h)) - p, range(x) + c(-8, 8) * h)$root, error = function(e) NA_real_)
+}
+est_kernel <- function(x, P, gen, h) {
+  xs <- sort(x); n <- length(x)
+  t(vapply(P, function(p) {
+    q <- kernel_quantile(x, p, h, xs[ceiling(n * p - 1e-9)])
+    if (!is.finite(q)) return(c(Q = NA_real_, T = NA_real_))
+    a <- (q - x) / h
+    if (gen$name == "quad") return(c(Q = q, T = sum(x * pnorm(-a) + h * dnorm(a)) / (n * (1 - p))))
+    far <- a < -8; band <- abs(a) <= 8
+    ab <- a[band]; half <- (8 - ab) / 2; mid <- (8 + ab) / 2; Z <- outer(half, .GL40$x) + mid
+    s_band <- sum(drop((gen$g1(x[band] + h * Z) * dnorm(Z)) %*% .GL40$w) * half)
+    c(Q = q, T = (sum(gen$g1(x[far])) + s_band) / (n * (1 - p)))
+  }, numeric(2)))
+}
+#' Recursive estimators (revised algorithm) with Newton gains: warm start, gain 1/f_hat on Q and the
+#' control-variate correction -gamma'(Q)(W - p)/(1 - p) in the theta-recursion.
+#' type = "indicator": W = 1{X <= Q}, step 1/i; "kernel": W = Phi((Q - X)/h_i), h_i = i^-a, step 1/i;
+#' "pr": kernel version with step i^-0.8, h_i = i^-0.4 and Polyak-Ruppert averaging of the theta-iterates.
+est_recursive <- function(x, P, gen, type = c("kernel", "indicator", "pr"), a = 0.3, rho = 0.8) {
+  type <- match.arg(type); n <- length(x); r <- 1 - P
+  n0 <- min(max(vapply(P, n0_rule, 1L)), floor(n / 4))
+  w0 <- est_emp(x[1:n0], P, gen); Q <- w0[, "Q"]; T <- w0[, "T"]; Tbar <- T
+  x0 <- x[1:n0]; hp <- robust_scale(x0) * n0^(-0.2)
+  fq <- vapply(Q, function(q) mean(dnorm((q - x0) / hp)) / hp, 1)
+  gq <- 1 / pmax(fq, 0.1 * r / robust_scale(x0))
+  g1x <- gen$g1(x)
+  for (i in (n0 + 1):n) {
+    xi <- x[i]; st <- if (type == "pr") i^(-rho) else 1 / i
+    W <- if (type == "indicator") as.numeric(xi <= Q) else pnorm((Q - xi) * i^a)
+    T <- T - st * (T - g1x[i] * (1 - W) / r - gen$g1(Q) * (W - P) / r)
+    Q <- Q - st * gq * (W - P)
+    if (type == "pr") Tbar <- Tbar + (T - Tbar) / (i - n0)
+  }
+  cbind(Q = Q, T = if (type == "pr") Tbar else T)
+}
+superquantile_stats <- function(z, estimator, gen, P, a = 0.3) {
+  switch(estimator,
+    empirical           = est_emp(z, P, gen),
+    kernel              = est_kernel(z, P, gen, length(z)^(-a)),
+    recursive_indicator = est_recursive(z, P, gen, "indicator", a),
+    recursive_kernel    = est_recursive(z, P, gen, "kernel", a),
+    recursive_pr        = est_recursive(z, P, gen, "pr", a = 0.4, rho = 0.8),   # best choice (article, Table rho)
+    stop("Unknown estimator: ", estimator))
+}
+#' Statistics on the standardised sample, upper tail and (optionally) lower tail.
+stats_thm <- function(x, estimator, gen, P, a = 0.3, two_sided = TRUE) {
+  m <- median(x); s <- robust_scale(x); z <- (x - m) / s
+  up <- superquantile_stats(z, estimator, gen, P, a)
+  out <- list(levels = P, m = m, s = s, Q_up = up[, "Q"], T_up = up[, "T"])
+  if (two_sided) { lo <- superquantile_stats(-z, estimator, gen, P, a); out$Q_lo <- lo[, "Q"]; out$T_lo <- lo[, "T"] }
+  out
+}
+
+superquantile_stats <- function(z, estimator, gen, P, a = 0.3) {
+  switch(estimator,
+    empirical           = est_emp(z, P, gen),
+    kernel              = est_kernel(z, P, gen, length(z)^(-a)),
+    recursive_indicator = est_recursive(z, P, gen, "indicator", a),
+    recursive_kernel    = est_recursive(z, P, gen, "kernel", a),
+    recursive_pr        = est_recursive(z, P, gen, "pr", a = 0.4, rho = 0.8),
+    stop("Unknown estimator: ", estimator))
+}
+stats_thm <- function(x, estimator, gen, P, a = 0.3, two_sided = TRUE) {
+  m <- median(x); s <- robust_scale(x); z <- (x - m) / s
+  up <- superquantile_stats(z, estimator, gen, P, a)
+  out <- list(levels = P, m = m, s = s, Q_up = up[, "Q"], T_up = up[, "T"])
+  if (two_sided) { lo <- superquantile_stats(-z, estimator, gen, P, a); out$Q_lo <- lo[, "Q"]; out$T_lo <- lo[, "T"] }
+  out
+}
+.lo <- c(1.05, -0.95, 0.05, -5); .hi <- c(2, 0.95, 10, 5)
+OPTIMIZERS <- c("lbfgsb", "neldermead", "nlminb", "de", "de+lbfgsb")
+obj_thm <- function(par, st, gen) {
+  a <- par[1]; b <- par[2]; g <- par[3]; zt <- par[4]
+  if (a <= 1.02 || a > 2 || abs(b) > 0.99 || g <= 0) return(1e10)
+  res <- (st$T_up - T_model(st$Q_up, a, b, g, zt, gen, st$levels)) / (1 + abs(st$T_up))
+  if (!is.null(st$Q_lo))
+    res <- c(res, (st$T_lo - T_model(st$Q_lo, a, -b, g, -zt, gen, st$levels)) / (1 + abs(st$T_lo)))
+  v <- sum(res^2); if (is.finite(v)) v else 1e10
+}
+.starts <- function() expand.grid(a = c(1.3, 1.6, 1.9), b = c(-0.4, 0, 0.4), g = c(0.5, 1), z = 0)
+.tr  <- function(u) c(1.05 + 0.95 * plogis(u[1]), 0.95 * tanh(u[2]), exp(u[3]), 5 * tanh(u[4]))   # R^4 -> box
+.inv <- function(p) c(qlogis((p[1] - 1.05) / 0.95), atanh(p[2] / 0.95), log(p[3]), atanh(p[4] / 5))
+.multistart <- function(f, solver, k = 3) {
+  S <- .starts(); v0 <- apply(S, 1, f); best <- NULL
+  for (i in order(v0)[seq_len(k)]) {
+    fit <- tryCatch(solver(as.numeric(S[i, ])), error = function(e) NULL)
+    if (!is.null(fit) && is.finite(fit$value) && (is.null(best) || fit$value < best$value)) best <- fit
+  }
+  if (is.null(best)) { i <- which.min(v0); best <- list(par = as.numeric(S[i, ]), value = v0[i], conv = 99L) }
+  best
+}
+opt_lbfgsb <- function(f) .multistart(f, function(s0) {
+  o <- optim(s0, f, method = "L-BFGS-B", lower = .lo, upper = .hi, control = list(maxit = 200))
+  list(par = o$par, value = o$value, conv = o$convergence) })
+opt_nm <- function(f) .multistart(function(p) f(p), function(s0) {
+  o <- optim(.inv(pmin(pmax(s0, .lo + 1e-6), .hi - 1e-6)), function(u) f(.tr(u)), method = "Nelder-Mead",
+             control = list(maxit = 800, reltol = 1e-10))
+  list(par = .tr(o$par), value = o$value, conv = o$convergence) })
+opt_nlminb <- function(f) .multistart(f, function(s0) {
+  o <- nlminb(s0, f, lower = .lo, upper = .hi, control = list(iter.max = 300))
+  list(par = o$par, value = o$objective, conv = o$convergence) })
+opt_de <- function(f, NP = 40, G = 60, Fw = 0.7, CR = 0.8) {          # DE/rand/1/bin (global search)
+  d <- 4; Pm <- sweep(sweep(matrix(runif(NP * d), NP, d), 2, .hi - .lo, "*"), 2, .lo, "+"); v <- apply(Pm, 1, f)
+  for (g in seq_len(G)) for (i in seq_len(NP)) {
+    idx <- sample(setdiff(seq_len(NP), i), 3)
+    mut <- pmin(pmax(Pm[idx[1], ] + Fw * (Pm[idx[2], ] - Pm[idx[3], ]), .lo), .hi)
+    cross <- runif(d) < CR; cross[sample.int(d, 1)] <- TRUE
+    trial <- ifelse(cross, mut, Pm[i, ]); vt <- f(trial)
+    if (vt <= v[i]) { Pm[i, ] <- trial; v[i] <- vt }
+  }
+  i <- which.min(v); list(par = Pm[i, ], value = v[i], conv = 0L)
+}
+opt_hybrid <- function(f) {                                           # DE exploration + L-BFGS-B polishing
+  d <- opt_de(f, NP = 30, G = 30)
+  o <- tryCatch(optim(d$par, f, method = "L-BFGS-B", lower = .lo, upper = .hi, control = list(maxit = 200)),
+                error = function(e) NULL)
+  if (!is.null(o) && o$value <= d$value) list(par = o$par, value = o$value, conv = o$convergence) else d
+}
+run_optimizer <- function(f, method) switch(method,
+  lbfgsb = opt_lbfgsb(f), neldermead = opt_nm(f), nlminb = opt_nlminb(f), de = opt_de(f), `de+lbfgsb` = opt_hybrid(f),
+  stop("Unknown optimizer: ", method))
+
+fit_from_stats <- function(st, gen, optimizer = "nlminb") {
+  cnt <- 0L
+  f <- function(par) { cnt <<- cnt + 1L; tryCatch(obj_thm(par, st, gen), error = function(e) 1e10) }
+  t0 <- proc.time()[["elapsed"]]; o <- run_optimizer(f, optimizer); tm <- proc.time()[["elapsed"]] - t0
+  list(alpha = o$par[1], beta = o$par[2], gamma = st$s * o$par[3], zeta = st$m + st$s * o$par[4],
+       obj = o$value, conv = o$conv, nfev = cnt, time_opt = tm)
+}
+
+ESTIMATORS <- c("empirical", "kernel", "recursive_indicator", "recursive_kernel", "recursive_pr")
+est_lab <- c(empirical = "Empirical", kernel = "Kernel", recursive_indicator = "Rec. indicator",
+             recursive_kernel = "Rec. kernel", recursive_pr = "Rec. PR")
+P_FIT <- c(0.25, 0.5, 0.75, 0.95)
+FIT_ba <- do.call(rbind, lapply(ESTIMATORS, function(E) {
+  r <- fit_from_stats(stats_thm(x_ba, E, GENS$quad, P_FIT, 0.3, TRUE), GENS$quad, "nlminb")
+  data.frame(method = est_lab[[E]], alpha = r$alpha, beta = r$beta, gamma = r$gamma, zeta = r$zeta, obj = r$obj)
+}))
+FIT_ba <- rbind(FIT_ba, data.frame(method = "ECF", alpha = PAR_ba[["alpha"]], beta = PAR_ba[["beta"]],
+                                   gamma = PAR_ba[["gamma"]], zeta = PAR_ba[["delta"]], obj = NA))
+if (!is.null(MIX)) FIT_ba <- rbind(FIT_ba, data.frame(method = "ML (MixStable)", alpha = MIX["Boeing daily log-losses", "alpha_mle"],
+                                   beta = MIX["Boeing daily log-losses", "beta_mle"], gamma = NA, zeta = NA, obj = NA))
+kable(FIT_ba, digits = 4, caption = "Boeing daily log-losses: stable parameters from quadratic Bregman superquantiles (Theorem 6.1) and benchmarks")
+## superquantiles of the stable law fitted by quadratic Bregman superquantiles (empirical estimator; Table 24)
+f1 <- FIT_ba[FIT_ba$method == "Empirical", ]
+PAR_sq <- c(alpha = f1$alpha, beta = f1$beta, gamma = f1$gamma, delta = f1$zeta)
+MOD_sq <- t(vapply(P_BA, stable_sq_model, numeric(3), par = PAR_sq, s = RES_ba$s_iqr)); rownames(MOD_sq) <- formatC(P_BA, format = "g")
+MOD_sq[, "cvar"] <- MOD_sq[, "Q"] + H_stable(MOD_sq[, "Q"], PAR_sq[["alpha"]], PAR_sq[["beta"]], PAR_sq[["gamma"]], PAR_sq[["delta"]]) / (1 - P_BA)
+kable(MOD_sq, digits = 5, caption = "Boeing: superquantiles of the stable law fitted by quadratic Bregman superquantiles (empirical)")
+## model-implied CVaR from Theorem 6.1 (replaces the numerical integration of the survival function)
+Q_mod <- MOD_ba[, "Q"]
+MOD_ba[, "cvar"] <- Q_mod + H_stable(Q_mod, PAR_ba[["alpha"]], PAR_ba[["beta"]], PAR_ba[["gamma"]], PAR_ba[["delta"]]) / (1 - P_BA)
+kable(MOD_ba, digits = 5, caption = "Boeing: quantile, CVaR (Theorem 6.1) and asinh-Bregman superquantile of the fitted stable law")
+```
+
+# LaTeX tables for the article
+
+```{r latex}
+#' Superquantile estimates: panel A (CVaR), panel B (asinh-Bregman); optional last column `extra`
+#' (list(cvar = named vector, asinh = named vector), names = formatted p).
+tex_sq <- function(R, name, caption, label, d = 2, extra = NULL, extra_lab = "") {
+  T <- R$tab; nc <- if (is.null(extra)) 6 else 7
+  L <- c("\\begin{table}[!htbp]\\centering", sprintf("\\caption{%s}\\label{%s}", caption, label),
+         "\\small\\setlength{\\tabcolsep}{5pt}", sprintf("\\begin{tabular}{%s}\\toprule", strrep("r", nc)),
+         paste0("$p$ & Empirical & Kernel & Rec.\\ indicator & Rec.\\ kernel & Rec.\\ PR",
+                if (nc == 7) paste0(" & ", extra_lab) else "", "\\\\\\midrule"))
+  for (key in c("cvar", "asinh")) {
+    L <- c(L, sprintf("\\multicolumn{%d}{l}{\\emph{%s}}\\\\", nc,
+                      if (key == "cvar") "CVaR (quadratic generator)" else
+                        sprintf("$\\asinh$-Bregman superquantile ($s=%s$)", formatC(R$s_iqr, format = "g", digits = 4))))
+    S <- T[T$key == key, ]
+    for (i in seq_len(nrow(S))) {
+      pk <- formatC(S$p[i], format = "g")
+      ev <- if (nc == 7) { v <- extra[[key]]; if (!is.null(v) && pk %in% names(v)) paste0(" & ", fmt(v[[pk]], d)) else " & " } else ""
+      L <- c(L, sprintf("%s & %s & %s & %s & %s & %s%s\\\\", pk, fmt(S$empirical[i], d), fmt(S$kernel[i], d),
+                        fmt(S$rec_ind[i], d), fmt(S$rec_ker[i], d), fmt(S$rec_pr[i], d), ev))
+    }
+    if (key == "cvar") L <- c(L, "\\midrule")
+  }
+  write_tex(c(L, "\\bottomrule", "\\end{tabular}", "\\end{table}"), name)
+}
+tex_ci <- function(R, name, caption, label, d = 2, pot = NULL) {
+  T <- R$tab
+  L <- c("\\begin{table}[!htbp]\\centering", sprintf("\\caption{%s}\\label{%s}", caption, label),
+         "\\small\\setlength{\\tabcolsep}{4pt}", "\\begin{tabular}{rlrlll}\\toprule",
+         "$p$ & Functional & Estimate & Wald & Bootstrap ($n$ out of $n$) & Bootstrap ($m$ out of $n$)\\\\\\midrule")
+  for (i in seq_len(nrow(T))) {
+    pk <- formatC(T$p[i], format = "g"); lab <- if (T$key[i] == "cvar") "CVaR" else "$\\asinh$"
+    L <- c(L, sprintf("%s & %s & %s & %s & %s & %s\\\\", pk, lab, fmt(T$empirical[i], d),
+                      fmt_ci(c(T$wald_lo[i], T$wald_hi[i]), d), fmt_ci(c(T$boot_lo[i], T$boot_hi[i]), d),
+                      fmt_ci(c(T$mboot_lo[i], T$mboot_hi[i]), d)))
+    if (!is.null(pot) && T$key[i] == "cvar" && pk %in% rownames(pot))
+      L <- c(L, sprintf(" & CVaR, POT--GPD & %s & \\multicolumn{3}{l}{parametric bootstrap %s}\\\\",
+                        fmt(pot[pk, "est"], d), fmt_ci(pot[pk, c("lo", "hi")], d)))
+    if (i < nrow(T) && T$p[i + 1] != T$p[i]) L <- c(L, "\\midrule")
+  }
+  write_tex(c(L, "\\bottomrule", "\\end{tabular}", "\\end{table}"), name)
+}
+EST_CAP <- "empirical, kernel ($h_n=\\widehat s\\,n^{-0.3}$) and recursive estimates in chronological order (indicator weights; kernel weights with $h_n=\\widehat s\\,n^{-0.4}$ and Newton gains; steps $n^{-0.8}$ with Polyak--Ruppert averaging and $h_n=\\widehat s\\,n^{-0.4}$)"
+pot_extra <- function(pot) list(cvar = setNames(pot[, "est"], rownames(pot)))
+tex_sq(RES_dan, "tab_danish_sq", paste0("Superquantile estimates for the Danish fire losses (millions of DKK): ", EST_CAP,
+       "; last column: POT--GPD estimate of the CVaR with threshold $Q_{0.90}$."), "tab:danish-sq", 2, pot_extra(POT_dan), "POT--GPD")
+tex_sq(RES_sp, "tab_sp_sq", paste0("Superquantile estimates for S\\&P 500 daily log-losses: ", EST_CAP,
+       "; last column: POT--GPD estimate of the CVaR with threshold $Q_{0.90}$."), "tab:sp-sq", 5, pot_extra(POT_sp), "POT--GPD")
+tex_sq(RES_ba, "tab_boeing_sq", paste0("Superquantile estimates for Boeing daily log-losses: ", EST_CAP,
+       "; last column: superquantile of the stable law fitted by quadratic Bregman superquantiles (Theorem~\\ref{thm:stable-quad} for the CVaR, numerical integration for $\\asinh$)."),
+       "tab:boeing-sq", 5, list(cvar = MOD_sq[, "cvar"], asinh = MOD_sq[, "asinh"]), "Stable fit")
+tex_ci(RES_dan, "tab_danish_ci", "Danish fire losses: $95\\%$ confidence intervals. Wald and $n$-out-of-$n$ intervals are reported only in the regular regime ($\\Var\\gamma'(X)<\\infty$); $m$-out-of-$n$ bootstrap with $m=n/2$ and rate $k^{1-\\widehat\\xi}$ for the CVaR, $k^{1/2}$ for the $\\asinh$-Bregman superquantile; --: not valid or fewer than $10$ exceedances in the subsample.",
+       "tab:danish-ci", 2, POT_dan)
+tex_ci(RES_sp, "tab_sp_ci", "S\\&P 500 daily log-losses: $95\\%$ confidence intervals (regular regime, $\\widehat\\xi<1/2$; same conventions as Table~\\ref{tab:danish-ci}).",
+       "tab:sp-ci", 5, POT_sp)
+tex_ci(RES_ba, "tab_boeing_ci", "Boeing daily log-losses: $95\\%$ confidence intervals, with the regime given by the fitted stable law ($\\xi=1/\\widehat\\alpha$; same conventions as Table~\\ref{tab:danish-ci}).",
+       "tab:boeing-ci", 5)
+
+## Boeing: stable parameters
+L <- c("\\begin{table}[!htbp]\\centering",
+       "\\caption{Boeing daily log-losses: parameters of $S(\\alpha,\\beta,\\gamma,\\zeta;0)$ estimated from quadratic Bregman superquantiles (Theorem~\\ref{thm:stable-quad}; levels $p\\in\\{0.25,0.5,0.75,0.95\\}$ of both tails, five superquantile estimators) and by the empirical characteristic function.}\\label{tab:boeing-params}",
+       "\\begin{tabular}{lrrrr}\\toprule", "Method & $\\widehat\\alpha$ & $\\widehat\\beta$ & $\\widehat\\gamma$ & $\\widehat\\zeta$\\\\\\midrule",
+       sprintf("%s & %s & %s & %s & %s\\\\", FIT_ba$method, fmt(FIT_ba$alpha, 3), fmt(FIT_ba$beta, 3), fmt(FIT_ba$gamma, 5), fmt(FIT_ba$zeta, 5)),
+       "\\bottomrule", "\\end{tabular}", "\\end{table}")
+write_tex(L, "tab_boeing_params")
+
+## goodness of fit of the stable model (three datasets)
+nm <- names(SDATA)
+row3 <- function(lab, v) paste0(lab, " & ", paste(v, collapse = " & "), "\\\\")
+cs_txt <- function(Q) if (anyNA(Q$alpha_range)) "empty" else sprintf("$[%.2f,%.2f]$", Q$alpha_range[1], Q$alpha_range[2])
+L <- c("\\begin{table}[!htbp]\\centering",
+       "\\caption{Boeing daily log-losses: the stable model. Fit: minimum distance on the empirical characteristic function, $S(\\alpha,\\beta,\\gamma,\\delta;0)$. KS, CvM, AD: parametric bootstrap with re-estimation. QCV: exact Monte Carlo tests of \\citet{pitera2022goodness} at $(\\widehat\\alpha,\\widehat\\beta)$; confidence set: projection on $\\alpha$ of the $95\\%$ Monte Carlo confidence set for $(\\alpha,\\beta)$ obtained by inverting the three QCV tests (Bonferroni), an empty set rejecting the stable family \\citep{beaulieu2014exact}. Tail: estimates of $\\xi$ on the data ($k=\\lfloor\\sqrt{n_+}\\rfloor$), with in brackets the $95\\%$ range of the same estimator on samples simulated from the fitted stable law. Aggregation: $\\widehat\\alpha_K$ fitted to sums of $K$ consecutive observations \\citep{burnecki2015discriminating}.}\\label{tab:stable-gof}",
+       "\\small\\begin{tabular}{lr}\\toprule",
+       row3("$\\widehat\\alpha$, $\\widehat\\beta$ (ECF)", sapply(GOF, function(g) sprintf("%.3f, %.3f", g$par[["alpha"]], g$par[["beta"]]))))
+if (!is.null(MIX)) L <- c(L, row3("$\\widehat\\alpha$, $\\widehat\\beta$ (ML, \\texttt{MixStable})",
+                                   sprintf("%.3f, %.3f", MIX[nm, "alpha_mle"], MIX[nm, "beta_mle"])))
+tn <- c("Kolmogorov--Smirnov", "Cram\\'er--von Mises", "Anderson--Darling")
+for (j in 1:3) L <- c(L, row3(sprintf("%s, $p$-value", tn[j]), sapply(GOF, function(g) fmt_p(g$p[j]))))
+for (j in 1:3) L <- c(L, row3(sprintf("QCV $N_%d$ at $(\\widehat\\alpha,\\widehat\\beta)$, $p$-value", j), sapply(QCV, function(q) fmt_p(q$p_fit[j]))))
+L <- c(L, row3("QCV $95\\%$ confidence set for $\\alpha$", sapply(QCV, cs_txt)), "\\midrule",
+       row3("$1/\\widehat\\alpha$", sapply(TAILC, function(T) fmt(T$inv_alpha, 3))))
+for (j in c("hill", "qq", "gpd")) L <- c(L, row3(c(hill = "$\\widehat\\xi$, Hill", qq = "$\\widehat\\xi$, QQ-estimator \\citep{kratz1996qq}",
+                                                  gpd = "$\\widehat\\xi$, POT--GPD ($u=Q_{0.90}$)")[[j]],
+  sapply(TAILC, function(T) sprintf("%s [%s, %s]", fmt(T$obs[[j]], 3), fmt(T$sim_lo[[j]], 2), fmt(T$sim_hi[[j]], 2)))))
+L <- c(L, "\\midrule")
+for (K in c(1, 5, 10)) L <- c(L, row3(sprintf("$\\widehat\\alpha_K$, $K=%d$", K), fmt(AGG_SUM[nm, as.character(K)], 3)))
+write_tex(c(L, "\\bottomrule", "\\end{tabular}", "\\end{table}"), "tab_stable_gof")
+cat("Tables written to", file.path(OUT, "tables"), ":", paste(list.files(file.path(OUT, "tables")), collapse = ", "), "\n")
+```
+
+```{r session}
+sessionInfo()
+```
