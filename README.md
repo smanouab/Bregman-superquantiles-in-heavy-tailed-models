@@ -35,8 +35,9 @@ This repository provides the full R implementation, simulation studies, and real
 
 ```text
 .
-├── R/                     # R code for estimators (empirical, kernel, recursive)
-├── simulations/           # Scripts reproducing the finite-sample performance checks
-├── applications/          # Real-world data analyses (Danish fire, S&P 500, Boeing)
-├── paper/                 # LaTeX source files and supplementary materials
-└── README.md              # Repository documentation
+├── contam_p0.8.json                   # Configuration files for contamination scenarios (e.g., GPD p = 0.8)
+├── gpd_contam.py                      # Python scripts for data contamination and simulation generation
+├── stable_parameters_superquantiles.Rmd # R Markdown: Estimation and parameters for stable laws
+├── application_superquantiles.Rmd     # R Markdown: Real-world financial/insurance data applications
+├── bregman_simulation_study.Rmd       # R Markdown: Monte Carlo simulations and asymptotic checks
+└── README.md                          # Repository documentation
